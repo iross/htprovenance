@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# Provenance runtime artifacts (this package's own output)
+output/provenance/
+*.ndjson
+provenance.db
+site_info.json
+.htprovenance_autocapture_done
+
+# Local env
+.env

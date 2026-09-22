@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "htprovenance"
+version = "0.1.0rc1"
+description = "Provenance capture and querying for HTCondor jobs and the artifacts they produce"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pyyaml>=6.0.2",
+    "typer>=0.16.0",
+    "htcondor>=25.8.2; sys_platform == 'linux'",
+]
+
+[project.scripts]
+htprovenance-pre         = "htprovenance.pre:main"
+htprovenance-post        = "htprovenance.post:main"
+htprovenance-log-monitor = "htprovenance.log_monitor:main"
+htprovenance-query       = "htprovenance.query:main"
+htprovenance-repair      = "htprovenance.repair:main"
+
+[project.urls]
+Homepage = "https://github.com/iross/htprovenance"
+Repository = "https://github.com/iross/htprovenance"
+
+[tool.hatch.build.targets.wheel]
+packages = ["htprovenance"]
+
+# Installs a .pth file that imports htprovenance._autorun at the start of every
+# Python process in this environment -- the zero-config auto-capture hook (see
+# htprovenance/_autorun.py and autocapture.py). hatch-autorun is a
+# build-time-only dependency (used by hatchling while building the wheel, never
+# installed alongside htprovenance) maintained by hatchling's own author
+# specifically for this .pth-injection pattern, avoiding the
+# editable-install/load-ordering pitfalls of hand-writing a custom build hook.
+[tool.hatch.build.targets.wheel.hooks.autorun]
+dependencies = ["hatch-autorun==1.1.0"]
+code = "import htprovenance._autorun"
+
+[tool.ruff]
+target-version = "py39"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
