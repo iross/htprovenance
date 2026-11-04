@@ -4,7 +4,7 @@ title: Default run_id for non-DAG jobs and record the schedd
 status: In Progress
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-04 22:21'
+updated_date: '2026-11-04 22:25'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -58,7 +58,7 @@ ClusterIds are unique only per schedd, so a database holding jobs from more than
 - [x] #13 README documents run_id resolution order and the NDJSON naming scheme
 - [x] #14 README's statements that jobs are keyed by (cluster_id, proc_id) are updated to include schedd, and scan's --schedd option is documented
 - [x] #15 Docstrings that describe the old behavior are updated: autocapture module and capture_and_emit, events.event_log_path, db.py's condor_history schema comment, event_log_scan module
-- [ ] #16 Verified on ap2001 whether output/provenance/ comes back without explicit transfer_output_files; README documents the answer
+- [x] #16 Verified on ap2001 whether output/provenance/ comes back without explicit transfer_output_files; README documents the answer
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -74,4 +74,9 @@ Unverified on a real access point (tests use fakes):
 - _get_schedd now locates the local schedd via Collector.locate(DaemonTypes.Schedd) with no name, to read its Name. Confirm on ap2001/ap2002 that this returns the local schedd.
 - scan's schedd comes from alias= in the 000 event's 'Job submitted from host: <...>' address. Confirm against a real log (e.g. the ap2002 precmd test.log) that alias is present and equals the schedd Name in GlobalJobId.
 - AC #16 (does output/provenance/ come back without transfer_output_files) is still open.
+
+Verified 2026-11-04:
+- ap2002: Collector().locate(DaemonTypes.Schedd)['Name'] returns ap2002.chtc.wisc.edu; the submit event's alias=ap2002.chtc.wisc.edu matches GlobalJobId's schedd part (with an IPv6 addrs= entry in the address, which the regex handles).
+- ap2001 jobs 12419027 / 12419028: with no transfer_output_files, only top-level top.txt came back (4 bytes sent); output/provenance/test.ndjson did not. With transfer_output_files = output, top.txt, both came back (22 bytes). Documented in README.
+Open question raised with the user: non-DAG jobs therefore don't return their NDJSON by default; consider writing to the sandbox top level when not in a DAG. Related: site_info.json and the .htprovenance_autocapture_done marker are top-level files, so they already come back by default and site_info.json overwrites across procs in a shared Iwd.
 <!-- SECTION:NOTES:END -->

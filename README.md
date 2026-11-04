@@ -62,6 +62,18 @@ inside each event keeps the original text, and `db build` reads it from there.
 The event also records `schedd` (taken from `GlobalJobId`), since a
 `ClusterId` is only unique per access point.
 
+These files are written inside the job's sandbox, under `output/provenance/`
+(or `$PROVENANCE_LOG_DIR`). HTCondor's default output transfer only returns new
+files at the top level of the sandbox, not new subdirectories, so a plain job
+must name the directory for its provenance to come back:
+
+```
+transfer_output_files = output, <your other outputs>
+```
+
+(Tested on CHTC's ap2001, 2026-11-04: without `transfer_output_files`, only the
+top-level file came back; with `output` listed, `output/provenance/` did.)
+
 ## CLI
 
 | Command | Purpose |
