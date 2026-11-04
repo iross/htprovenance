@@ -13,6 +13,14 @@ Detection reuses $_CONDOR_JOB_AD, the same env var htprovenance.jobad
 already relies on to locate the job's ClassAd snapshot (see its module
 docstring) -- one detection signal, not two independently-drifting ones.
 
+run_id for an execute-node job is $PROVENANCE_RUN_ID when set (mldag's
+generated DAGs set it; their file naming is unchanged). Otherwise -- a plain
+condor_submit, or a hand-written DAG -- it is the job's JobBatchName, else
+cluster-<ClusterId>, and the job writes its own
+<run_id>.<cluster>.<proc>.ndjson so procs returning to a shared directory
+never overwrite each other's file. See execute_node_run_id /
+execute_node_ndjson_stem.
+
 Processes on the access point see $_CONDOR_JOB_AD too: DAGMan's PRE/POST
 scripts inherit DAGMan's own (scheduler-universe) ad, and SERVICE nodes run
 as local-universe jobs. Those are recorded as dagman.started /
@@ -111,6 +119,51 @@ def submit_host_capture_target(ad: dict) -> tuple[str, str, int | None] | None:
     if dagman_cluster_id is not None:
         return event_type, f"dagman-{dagman_cluster_id}", dagman_cluster_id
     return event_type, f"local-{cluster_id}", None
+
+
+def execute_node_run_id(ad: dict) -> str:
+    """Return the run_id for an execute-node job.
+
+    Resolution order: $PROVENANCE_RUN_ID, then the job's JobBatchName (several
+    submits sharing a batch name group under one run_id), then
+    cluster-<ClusterId> (one condor_submit is one run). "unknown" only when
+    the job ad is unreadable.
+    """
+    run_id = os.environ.get("PROVENANCE_RUN_ID")
+    if run_id:
+        return run_id
+    batch_name = ad.get("JobBatchName")
+    if batch_name:
+        return str(batch_name)
+    cluster_id = _ad_int(ad, "ClusterId")
+    if cluster_id is not None:
+        return f"cluster-{cluster_id}"
+    return "unknown"
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+_MAX_STEM_RUN_ID_CHARS = 200
+
+
+def execute_node_ndjson_stem(run_id: str, ad: dict) -> str | None:
+    """Return the NDJSON file stem for an execute-node job, or None to use run_id.
+
+    Jobs with $PROVENANCE_RUN_ID keep the per-run <run_id>.ndjson file. Any
+    other job gets <run_id>.<cluster>.<proc>: a JobBatchName run_id can span
+    several clusters, and every proc writes its own sandbox copy, so a shared
+    name would be overwritten when outputs return to one directory. run_id
+    can be free text (JobBatchName), so it's made filename-safe here; the
+    event itself keeps the original.
+    """
+    if os.environ.get("PROVENANCE_RUN_ID"):
+        return None
+    cluster_id = _ad_int(ad, "ClusterId")
+    proc_id = _ad_int(ad, "ProcId")
+    if cluster_id is None or proc_id is None:
+        return None
+    safe_run_id = _UNSAFE_FILENAME_CHARS.sub("_", run_id)[:_MAX_STEM_RUN_ID_CHARS]
+    safe_run_id = safe_run_id.lstrip(".") or "_"
+    return f"{safe_run_id}.{cluster_id}.{proc_id}"
 
 
 def default_gpu_info() -> tuple[dict, str]:
@@ -213,7 +266,7 @@ def capture_and_emit(
     """Best-effort: record where this HTCondor job is running.
 
     On an execute node, writes site_info.json and emits job.assigned under
-    $PROVENANCE_RUN_ID. For DAGMan and its SERVICE nodes on the access point,
+    the run_id from execute_node_run_id. For DAGMan and its SERVICE nodes on the access point,
     emits dagman.started / service.started under dagman-<DAGMan cluster>
     instead, without writing site_info.json or probing GPUs.
 
@@ -231,7 +284,7 @@ def capture_and_emit(
         target = submit_host_capture_target(ad)
         if target is not None:
             return _capture_submit_host(ad, target, log_dir, fields_file)
-        return _capture_execute_node(log_dir, gpu_info, fields_file)
+        return _capture_execute_node(ad, log_dir, gpu_info, fields_file)
     except Exception:  # noqa: BLE001 -- deliberately blind: AC#7's whole point
         # is that any failure here (best-effort) must never affect the
         # training job's own behavior, output, or exit code.
@@ -278,14 +331,14 @@ if __name__ == "__main__":
 
 
 def _capture_execute_node(
-    log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
+    ad: dict, log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
 ) -> dict | None:
     import json
 
     marker = Path(_MARKER_FILENAME)
     if marker.exists():
         return None
-    run_id = os.environ.get("PROVENANCE_RUN_ID", "unknown")
+    run_id = execute_node_run_id(ad)
     site_info, site_info_source = gather_site_info(gpu_info)
     payload = {**site_info, **gather_env_info(), **capture_job_ad_fields(fields_file)}
     Path("site_info.json").write_text(json.dumps(payload, indent=2))
@@ -293,6 +346,7 @@ def _capture_execute_node(
         "job.assigned",
         run_id,
         log_dir=log_dir,
+        ndjson_stem=execute_node_ndjson_stem(run_id, ad),
         source="execute_node_autocapture",
         site_info_source=site_info_source,
         **payload,
@@ -317,6 +371,13 @@ def _capture_submit_host(
         **capture_job_ad_fields(fields_file),
         "dagman_cluster_id": dagman_cluster_id,
     }
-    emit_event(event_type, run_id, log_dir=log_dir, source="submit_host_autocapture", **payload)
+    emit_event(
+        event_type,
+        run_id,
+        log_dir=log_dir,
+        ndjson_stem=None,
+        source="submit_host_autocapture",
+        **payload,
+    )
     marker.write_text("")
     return payload

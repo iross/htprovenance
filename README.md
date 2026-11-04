@@ -41,6 +41,27 @@ database keyed by `(cluster_id, proc_id)`:
   capture into the same table; a raw event log can be scanned directly for jobs
   that were never instrumented at all.
 
+## Run IDs for jobs outside a generated DAG
+
+The execute-side capture files its `job.assigned` event under a `run_id`,
+resolved from the job's environment and ClassAd:
+
+1. `PROVENANCE_RUN_ID`, if set. mldag's generated DAGs set it; those events go
+   to `<run_id>.ndjson` as before.
+2. `JobBatchName`, if set. Submits that share a batch name share a `run_id`.
+   A hand-written DAG gets DAGMan's default batch name
+   (`<dagfile>+<DAGMan cluster>`), so its nodes group per DAG run.
+3. `cluster-<ClusterId>` otherwise: one `condor_submit` is one run.
+
+For cases 2 and 3 each job writes its own `<run_id>.<cluster>.<proc>.ndjson`,
+so the procs of a `queue N` never overwrite each other's file when their
+outputs come back to the same directory. The file name has unsafe characters
+in the batch name replaced with `_` and is capped in length; the `run_id`
+inside each event keeps the original text, and `db build` reads it from there.
+
+The event also records `schedd` (taken from `GlobalJobId`), since a
+`ClusterId` is only unique per access point.
+
 ## CLI
 
 | Command | Purpose |

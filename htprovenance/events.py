@@ -5,7 +5,10 @@ shared filesystem.  All writes use O_APPEND mode; on POSIX systems writes
 smaller than PIPE_BUF (~4 KB) are atomic, so concurrent epoch writers are
 safe without additional locking.
 
-Event log location: <log_dir>/<run_id>.ndjson
+Event log location: <log_dir>/<run_id>.ndjson, or <log_dir>/<ndjson_stem>.ndjson
+                    when the caller passes one (execute-node capture for jobs
+                    without PROVENANCE_RUN_ID writes one file per cluster.proc;
+                    see htprovenance.autocapture)
 Default log_dir:    output/provenance
 """
 
@@ -43,9 +46,9 @@ VALID_EVENT_TYPES: frozenset[str] = frozenset({
 _DEFAULT_LOG_DIR = "output/provenance"
 
 
-def event_log_path(run_id: str, log_dir: str | Path = _DEFAULT_LOG_DIR) -> Path:
-    """Return the path to the NDJSON event log for run_id."""
-    return Path(log_dir) / f"{run_id}.ndjson"
+def event_log_path(stem: str, log_dir: str | Path = _DEFAULT_LOG_DIR) -> Path:
+    """Return the path to the NDJSON event log named stem (usually the run_id)."""
+    return Path(log_dir) / f"{stem}.ndjson"
 
 
 def emit_event(
@@ -53,14 +56,18 @@ def emit_event(
     run_id: str,
     *,
     log_dir: str | Path = _DEFAULT_LOG_DIR,
+    ndjson_stem: str | None = None,
     **fields,
 ) -> None:
-    """Append one structured event line to the run's NDJSON log.
+    """Append one structured event line to an NDJSON log.
 
     Args:
-        event_type: One of the seven defined lifecycle event types.
-        run_id: Stable run identifier (PROVENANCE_RUN_ID).
+        event_type: One of VALID_EVENT_TYPES.
+        run_id: Stable run identifier, written into the event itself.
         log_dir: Directory for NDJSON files; created if absent.
+        ndjson_stem: File name (without .ndjson) to append to. Defaults to
+            run_id. db.build_database reads run_id from each event line, not
+            from the file name, so the two are free to differ.
         **fields: Event-specific payload fields merged into the envelope.
 
     Raises:
@@ -80,7 +87,7 @@ def emit_event(
         **fields,
     }
 
-    log_path = event_log_path(run_id, log_dir)
+    log_path = event_log_path(ndjson_stem or run_id, log_dir)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Serialise to a single line; compact separators keep it under PIPE_BUF.

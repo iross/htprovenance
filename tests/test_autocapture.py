@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -407,6 +408,121 @@ def test_capture_and_emit_passes_through_fields_file(monkeypatch, tmp_path):
         "cluster_id": 555,
         "proc_id": 0,
     }
+
+
+# --- run_id and NDJSON file for jobs without PROVENANCE_RUN_ID ---
+
+
+PLAIN_JOB_AD = {
+    "ClusterId": 555,
+    "ProcId": 0,
+    "JobUniverse": 5,
+    "GlobalJobId": "ap2002.chtc.wisc.edu#555.0#1793900000",
+}
+
+
+@pytest.fixture
+def execute_node(monkeypatch, tmp_path):
+    """A plain condor_submit job's sandbox: no PROVENANCE_RUN_ID."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PROVENANCE_RUN_ID", raising=False)
+    monkeypatch.setenv("PROVENANCE_LOG_DIR", str(tmp_path / "output" / "provenance"))
+    monkeypatch.setattr(autocapture, "_run", lambda cmd: "node01")
+    monkeypatch.setattr(
+        autocapture,
+        "default_gpu_info",
+        lambda: ({"gpu_count": 0, "gpu_model": "none", "gpu_id": "none"}, "none"),
+    )
+    return tmp_path
+
+
+def _ndjson_files(root: Path) -> list[str]:
+    return sorted(p.name for p in (root / "output" / "provenance").iterdir())
+
+
+def test_run_id_is_cluster_when_no_env_var_or_batch_name(monkeypatch, execute_node):
+    _capture_as(monkeypatch, execute_node, PLAIN_JOB_AD)
+
+    assert _ndjson_files(execute_node) == ["cluster-555.555.0.ndjson"]
+    [event] = _events(execute_node / "output" / "provenance" / "cluster-555.555.0.ndjson")
+    assert event["type"] == "job.assigned"
+    assert event["run_id"] == "cluster-555"
+
+
+def test_run_id_is_batch_name_when_set(monkeypatch, execute_node):
+    _capture_as(monkeypatch, execute_node, {**PLAIN_JOB_AD, "JobBatchName": "sweep-a"})
+
+    assert _ndjson_files(execute_node) == ["sweep-a.555.0.ndjson"]
+    [event] = _events(execute_node / "output" / "provenance" / "sweep-a.555.0.ndjson")
+    assert event["run_id"] == "sweep-a"
+
+
+def test_env_var_wins_over_batch_name_and_keeps_per_run_file(monkeypatch, execute_node):
+    monkeypatch.setenv("PROVENANCE_RUN_ID", "run-abc123")
+    _capture_as(monkeypatch, execute_node, {**PLAIN_JOB_AD, "JobBatchName": "sweep-a"})
+
+    assert _ndjson_files(execute_node) == ["run-abc123.ndjson"]
+    [event] = _events(execute_node / "output" / "provenance" / "run-abc123.ndjson")
+    assert event["run_id"] == "run-abc123"
+
+
+def test_unsafe_batch_name_is_sanitized_in_file_name_only(monkeypatch, execute_node):
+    batch_name = "../my sweep/v2"
+    _capture_as(monkeypatch, execute_node, {**PLAIN_JOB_AD, "JobBatchName": batch_name})
+
+    assert _ndjson_files(execute_node) == ["_my_sweep_v2.555.0.ndjson"]
+    [event] = _events(execute_node / "output" / "provenance" / "_my_sweep_v2.555.0.ndjson")
+    assert event["run_id"] == batch_name
+
+
+def test_long_batch_name_is_truncated_in_file_name(execute_node):
+    stem = autocapture.execute_node_ndjson_stem("x" * 1000, PLAIN_JOB_AD)
+
+    assert stem == "x" * autocapture._MAX_STEM_RUN_ID_CHARS + ".555.0"
+
+
+def test_procs_of_one_cluster_write_distinct_files(monkeypatch, execute_node):
+    for proc_id in (0, 1):
+        sandbox = execute_node / f"sandbox{proc_id}"
+        sandbox.mkdir()
+        monkeypatch.chdir(sandbox)
+        _capture_as(monkeypatch, sandbox, {**PLAIN_JOB_AD, "ProcId": proc_id})
+
+    assert _ndjson_files(execute_node) == [
+        "cluster-555.555.0.ndjson",
+        "cluster-555.555.1.ndjson",
+    ]
+
+
+def test_unreadable_job_ad_falls_back_to_unknown(monkeypatch, execute_node):
+    monkeypatch.setenv("_CONDOR_JOB_AD", str(execute_node / "never-written.ad"))
+
+    payload = autocapture.capture_and_emit()
+
+    assert payload is not None
+    assert _ndjson_files(execute_node) == ["unknown.ndjson"]
+
+
+def test_job_assigned_records_schedd(monkeypatch, execute_node):
+    payload = _capture_as(monkeypatch, execute_node, PLAIN_JOB_AD)
+
+    assert payload is not None
+    assert payload["schedd"] == "ap2002.chtc.wisc.edu"
+
+
+def test_db_build_reads_run_id_from_event_not_file_name(monkeypatch, execute_node):
+    from htprovenance.db import build_database
+
+    batch_name = "my sweep/v2"
+    _capture_as(monkeypatch, execute_node, {**PLAIN_JOB_AD, "JobBatchName": batch_name})
+    db_path = execute_node / "provenance.db"
+
+    build_database(db_path, [], [execute_node / "output" / "provenance"])
+
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute("SELECT run_id, type FROM events").fetchall()
+    conn.close()
+    assert rows == [(batch_name, "job.assigned")]
 
 
 # --- main() CLI ---
