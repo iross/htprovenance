@@ -4,7 +4,7 @@ title: 'Selectable transport for in-job capture: NDJSON file and/or Chirp'
 status: To Do
 assignee: []
 created_date: '2026-11-04 22:33'
-updated_date: '2026-11-04 22:55'
+updated_date: '2026-11-04 22:58'
 labels: []
 dependencies:
   - TASK-1
@@ -76,4 +76,9 @@ Q1 (containers): Docker-run container: no condor_chirp binary; _CONDOR_CHIRP_CON
 Design consequences: one ChirpProv* attribute per field (a JSON blob won't fit); values over the limit must be truncated or skipped and noted; use htchirp in Python (no dependency on /usr/libexec/condor/condor_chirp) or speak the protocol directly; Docker jobs need the file fallback, which the design already has.
 
 Related prior work: mldag task-42 (Push execute-node provenance back via Chirp instead of relying on output-file transfer) planned a chirp put() of the payload to <run_id>.execute_node.ndjson on the AP. That is the Chirp file-I/O path (needs the I/O proxy / ENABLE_CHIRP_IO), distinct from delayed attributes; worth testing put_file without WantIOProxy as another option.
+
+Docker follow-up 2026-11-04 (ap2001 jobs 12419075, 12419076, 12419079; scripts in scratchpad chirp-probe/):
+- The chirp config inside a Docker job reads '127.0.0.1 <port> <cookie>'. Default bridge networking: container IP 172.17.0.x, connecting to 127.0.0.1 is refused (container loopback), and the default gateway 172.17.0.1 (host docker0) is also refused, so the starter's chirp server listens on host loopback only. No zero-config path for default Docker jobs.
+- With docker_network_type = host in the submit file, htchirp works unchanged: ChirpProvDocker landed in the job ad and the ulog line appeared as a 008 event.
+So: Docker-universe jobs get Chirp only with docker_network_type = host; otherwise they fall back to the file transport. README should say so. Apptainer still untested.
 <!-- SECTION:NOTES:END -->
