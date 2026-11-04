@@ -4,7 +4,7 @@ title: Default run_id for non-DAG jobs and record the schedd
 status: In Progress
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-04 22:35'
+updated_date: '2026-11-04 22:39'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -82,4 +82,6 @@ Open question raised with the user: non-DAG jobs therefore don't return their ND
 
 Follow-up (user decision, 2026-11-04): non-DAG jobs (no PROVENANCE_RUN_ID, no PROVENANCE_LOG_DIR) now write their NDJSON at the sandbox top level so default output transfer returns it. mldag DAGs and explicit PROVENANCE_LOG_DIR unchanged; access-point captures keep output/provenance.
 Not changed: site_info.json (top-level, read by watcher.py's _load_site_info and possibly mldag scripts) still comes back by default and is overwritten per proc in a shared directory; the .htprovenance_autocapture_done marker also comes back. Left for the user to decide since site_info.json is a cross-repo contract.
+
+site_info.json removed (user decision, 2026-11-04): it duplicated the job.assigned payload. watcher._load_site_info now reads the job's job.assigned event from autocapture.execute_node_event_log_path(ad). No code in the MLDAG, mldag, MLDAG_check or CHTC_MLDAG checkouts reads site_info.json outside their own vendored copies of these modules. The .htprovenance_autocapture_done marker still comes back with default transfer.
 <!-- SECTION:NOTES:END -->

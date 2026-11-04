@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+from htprovenance import autocapture
 from htprovenance.watcher import (
     _load_site_info,
     _parse_epoch,
@@ -51,39 +52,75 @@ def test_main_log_dir_flag_overrides_env(tmp_path):
 # --- _load_site_info ---
 
 
-def test_load_site_info_reads_file(tmp_path):
-    (tmp_path / "site_info.json").write_text(
-        json.dumps({
-            "hostname": "gpu04.chtc.wisc.edu",
-            "slot": "slot1_1",
-            "gpu_model": "A100",
-            "gpu_count": 4,
-            "gpu_id": "GPU-abc123",
-            "python": "3.11.4",
-            "cuda": "12.2",
-            "code_commit": "abc123",
-        })
+SITE_JOB_AD = {"ClusterId": 555, "ProcId": 0, "JobUniverse": 5}
+
+
+def _write_job_assigned(monkeypatch, sandbox: Path, extra_events: tuple[dict, ...] = ()) -> None:
+    """Run the real autocapture in a fake sandbox, then append any extra event lines."""
+    monkeypatch.chdir(sandbox)
+    job_ad = sandbox / ".job.ad"
+    job_ad.write_text("".join(f"{k} = {v}\n" for k, v in SITE_JOB_AD.items()))
+    monkeypatch.setenv("_CONDOR_JOB_AD", str(job_ad))
+    monkeypatch.delenv("PROVENANCE_RUN_ID", raising=False)
+    monkeypatch.delenv("PROVENANCE_LOG_DIR", raising=False)
+    monkeypatch.setattr(autocapture, "_run", lambda cmd: "gpu04.chtc.wisc.edu")
+    monkeypatch.setattr(
+        autocapture,
+        "default_gpu_info",
+        lambda: ({"gpu_count": 4, "gpu_model": "A100", "gpu_id": "GPU-abc123"}, "nvidia_smi"),
     )
-    site, env = _load_site_info(tmp_path)
-    assert site["hostname"] == "gpu04.chtc.wisc.edu"
-    assert site["gpu_model"] == "A100"
-    assert site["gpu_id"] == "GPU-abc123"
-    assert env["python"] == "3.11.4"
-    assert env["cuda"] == "12.2"
+    autocapture.capture_and_emit()
+    path = autocapture.execute_node_event_log_path(SITE_JOB_AD)
+    with open(path, "a") as f:
+        for event in extra_events:
+            f.write(json.dumps(event) + "\n")
+
+
+def test_load_site_info_reads_job_assigned_event(monkeypatch, tmp_path):
+    _write_job_assigned(monkeypatch, tmp_path)
+
+    site, env = _load_site_info()
+
+    assert site == {
+        "hostname": "gpu04.chtc.wisc.edu",
+        "slot": "unknown",
+        "gpu_model": "A100",
+        "gpu_count": 4,
+        "gpu_id": "GPU-abc123",
+    }
+    assert env["code_commit"] == "gpu04.chtc.wisc.edu"
+    assert env["cluster_id"] == 555
     assert "gpu_id" not in env
+    assert not {"type", "run_id", "ts", "source", "site_info_source"} & env.keys()
 
 
-def test_load_site_info_missing_file(tmp_path):
-    site, env = _load_site_info(tmp_path)
-    assert site == {}
-    assert env == {}
+def test_load_site_info_ignores_other_events_and_malformed_lines(monkeypatch, tmp_path):
+    _write_job_assigned(
+        monkeypatch, tmp_path, ({"type": "epoch.completed", "run_id": "x", "hostname": "other"},)
+    )
+    with open(autocapture.execute_node_event_log_path(SITE_JOB_AD), "a") as f:
+        f.write("not json\n")
+
+    site, _ = _load_site_info()
+
+    assert site["hostname"] == "gpu04.chtc.wisc.edu"
 
 
-def test_load_site_info_malformed_json(tmp_path):
-    (tmp_path / "site_info.json").write_text("not json")
-    site, env = _load_site_info(tmp_path)
-    assert site == {}
-    assert env == {}
+def test_load_site_info_outside_condor_job(monkeypatch):
+    monkeypatch.delenv("_CONDOR_JOB_AD", raising=False)
+
+    assert _load_site_info() == ({}, {})
+
+
+def test_load_site_info_no_event_file(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    job_ad = tmp_path / ".job.ad"
+    job_ad.write_text("ClusterId = 555\nProcId = 0\n")
+    monkeypatch.setenv("_CONDOR_JOB_AD", str(job_ad))
+    monkeypatch.delenv("PROVENANCE_RUN_ID", raising=False)
+    monkeypatch.delenv("PROVENANCE_LOG_DIR", raising=False)
+
+    assert _load_site_info() == ({}, {})
 
 
 # --- _sorted_by_mtime ---
@@ -187,16 +224,13 @@ def test_watch_and_emit_second_epoch_started_carries_prior_hash(tmp_path):
     assert started_events[1]["checkpoint_in_hash"].startswith("sha256:")
 
 
-def test_watch_and_emit_reads_site_info_for_sidecar(tmp_path):
+def test_watch_and_emit_reads_site_info_for_sidecar(monkeypatch, tmp_path):
+    _write_job_assigned(monkeypatch, tmp_path)
     log_dir = tmp_path / "provenance"
-    (tmp_path / "site_info.json").write_text(
-        json.dumps({"hostname": "gpu04", "slot": "slot1", "python": "3.11", "cuda": "12.2",
-                    "code_commit": "abc", "gpu_model": "A100", "gpu_count": 1})
-    )
     ckpt = _make_ckpt(tmp_path / "epoch0.ckpt")
     watch_and_emit(tmp_path, "run-1", poll_interval=0, idle_timeout=0, log_dir=log_dir)
     sidecar = json.loads(Path(str(ckpt) + ".provenance.json").read_text())
-    assert sidecar["produced_at"]["hostname"] == "gpu04"
+    assert sidecar["produced_at"]["hostname"] == "gpu04.chtc.wisc.edu"
 
 
 def test_watch_and_emit_no_checkpoints_exits_immediately(tmp_path):

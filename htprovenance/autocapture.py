@@ -1,13 +1,13 @@
 """Zero-config execute-node provenance auto-capture.
 
 Detects that the current process is running inside an HTCondor job and, if
-so, writes site_info.json (the contract htprovenance.watcher's
-_load_site_info already expects) and emits a job.assigned event -- with no
-call required from the training script itself. See htprovenance/_autorun.py
-for the interpreter-startup hook that makes this actually zero-config (a .pth
-file, installed by this package's build hook -- see hatch_build.py -- runs
-_autorun at the start of every Python process in an environment where this
-package is installed).
+so, emits a job.assigned event recording where it runs -- with no call
+required from the training script itself. htprovenance.watcher reads that
+event back (see execute_node_event_log_path) to stamp checkpoint sidecars.
+See htprovenance/_autorun.py for the interpreter-startup hook that makes this
+actually zero-config (a .pth file, installed by this package's build hook --
+see hatch_build.py -- runs _autorun at the start of every Python process in an
+environment where this package is installed).
 
 Detection reuses $_CONDOR_JOB_AD, the same env var htprovenance.jobad
 already relies on to locate the job's ClassAd snapshot (see its module
@@ -52,7 +52,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from htprovenance.events import _DEFAULT_LOG_DIR, emit_event
+from htprovenance.events import _DEFAULT_LOG_DIR, emit_event, event_log_path
 from htprovenance.jobad import capture_job_ad_fields
 from htprovenance.post import parse_classad
 
@@ -159,6 +159,17 @@ def execute_node_log_dir() -> Path:
     return Path()
 
 
+def execute_node_event_log_path(ad: dict) -> Path:
+    """Return the NDJSON file this execute-node job's job.assigned event is written to.
+
+    Derived from the same environment and job ad as the write, so code running
+    later in the same job (htprovenance.watcher) can find the event again.
+    """
+    run_id = execute_node_run_id(ad)
+    stem = execute_node_ndjson_stem(run_id, ad) or run_id
+    return event_log_path(stem, execute_node_log_dir())
+
+
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_STEM_RUN_ID_CHARS = 200
 
@@ -235,7 +246,7 @@ def gather_site_info(
     """Return (site_info, site_info_source).
 
     site_info is exactly the {hostname, slot, gpu_model, gpu_count, gpu_id}
-    shape watcher.py's _load_site_info splits out of site_info.json. Pass
+    shape watcher.py's _load_site_info splits out of the job.assigned event. Pass
     gpu_info to supply caller-detected values (e.g. pretrain_local.sh's own
     torch.cuda introspection, more precise than this module's nvidia-smi/proc
     fallback) instead of auto-detecting.
@@ -283,10 +294,10 @@ def capture_and_emit(
 ) -> dict | None:
     """Best-effort: record where this HTCondor job is running.
 
-    On an execute node, writes site_info.json and emits job.assigned under
-    the run_id from execute_node_run_id. For DAGMan and its SERVICE nodes on the access point,
-    emits dagman.started / service.started under dagman-<DAGMan cluster>
-    instead, without writing site_info.json or probing GPUs.
+    On an execute node, emits job.assigned under the run_id from
+    execute_node_run_id. For DAGMan and its SERVICE nodes on the access
+    point, emits dagman.started / service.started under
+    dagman-<DAGMan cluster> instead, without probing GPUs.
 
     Returns the emitted payload, or None if this isn't (detectably) an
     HTCondor job, this job was already captured (idempotency marker), or
@@ -314,8 +325,8 @@ def main() -> None:
     import json
 
     parser = argparse.ArgumentParser(
-        description="Best-effort execute-node provenance auto-capture: write "
-        "site_info.json and emit a job.assigned event. Safe to call "
+        description="Best-effort execute-node provenance auto-capture: emit "
+        "a job.assigned event. Safe to call "
         "unconditionally -- no-ops outside an HTCondor job or if this job's "
         "sandbox was already captured."
     )
@@ -351,15 +362,12 @@ if __name__ == "__main__":
 def _capture_execute_node(
     ad: dict, log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
 ) -> dict | None:
-    import json
-
     marker = Path(_MARKER_FILENAME)
     if marker.exists():
         return None
     run_id = execute_node_run_id(ad)
     site_info, site_info_source = gather_site_info(gpu_info)
     payload = {**site_info, **gather_env_info(), **capture_job_ad_fields(fields_file)}
-    Path("site_info.json").write_text(json.dumps(payload, indent=2))
     emit_event(
         "job.assigned",
         run_id,

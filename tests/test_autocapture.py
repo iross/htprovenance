@@ -297,7 +297,7 @@ def test_submit_host_capture_target(ad, expected):
     assert autocapture.submit_host_capture_target(ad) == expected
 
 
-def test_capture_and_emit_writes_site_info_and_emits_event(monkeypatch, tmp_path):
+def test_capture_and_emit_emits_event_without_site_info_file(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     job_ad = tmp_path / "job.ad"
     _write_job_ad(job_ad, SAMPLE_JOB_AD)
@@ -317,12 +317,7 @@ def test_capture_and_emit_writes_site_info_and_emits_event(monkeypatch, tmp_path
     assert payload["cluster_id"] == 555
     assert payload["hostname"] == "node01"
 
-    site_info = json.loads((tmp_path / "site_info.json").read_text())
-    assert site_info["arguments"] == "pretrain_local.sh 30 run-abc123 42"
-    assert site_info["hostname"] == "node01"
-    assert (
-        "source" not in site_info
-    )  # site_info.json never carries the event envelope fields
+    assert not (tmp_path / "site_info.json").exists()
 
     ndjson_path = tmp_path / "output" / "provenance" / "run-abc123.ndjson"
     events = [json.loads(line) for line in ndjson_path.read_text().splitlines()]
@@ -560,6 +555,18 @@ def test_access_point_capture_keeps_output_provenance_default(monkeypatch, acces
     _capture_as(monkeypatch, access_point, DAGMAN_AD)
 
     assert (access_point / "output" / "provenance" / "dagman-7810859.ndjson").exists()
+
+
+def test_execute_node_event_log_path_matches_where_the_event_was_written(
+    monkeypatch, execute_node
+):
+    ad = {**PLAIN_JOB_AD, "JobBatchName": "sweep a"}
+    _capture_as(monkeypatch, execute_node, ad)
+
+    path = autocapture.execute_node_event_log_path(ad)
+
+    assert path == execute_node / "output" / "provenance" / "sweep_a.555.0.ndjson"
+    assert path.exists()
 
 
 # --- main() CLI ---

@@ -26,7 +26,9 @@ import sys
 import time
 from pathlib import Path
 
+from htprovenance.autocapture import execute_node_event_log_path
 from htprovenance.events import _DEFAULT_LOG_DIR, emit_event
+from htprovenance.post import parse_classad
 from htprovenance.sidecar import write_sidecar
 
 _SHUTDOWN = False
@@ -37,18 +39,36 @@ def _handle_sigterm(signum, frame):
     _SHUTDOWN = True
 
 
-def _load_site_info(watch_dir: Path) -> tuple[dict, dict]:
-    """Read site_info.json written by the execute-node capture function.
+# Fields the job.assigned event carries around its payload; not site/env data.
+_EVENT_ENVELOPE_KEYS = {"schema_version", "type", "run_id", "ts", "source", "site_info_source"}
 
-    Returns (site_info, env_info) split as expected by write_sidecar.
+
+def _load_site_info() -> tuple[dict, dict]:
+    """Read this job's job.assigned event, written by htprovenance.autocapture.
+
+    Returns (site_info, env_info) split as expected by write_sidecar, or two
+    empty dicts when not in an HTCondor job or no job.assigned event exists
+    (autocapture didn't run, or its file is unreadable).
     """
-    site_json = watch_dir / "site_info.json"
-    if not site_json.exists():
+    job_ad_path = os.environ.get("_CONDOR_JOB_AD")
+    if not job_ad_path:
         return {}, {}
+    event_path = execute_node_event_log_path(parse_classad(job_ad_path))
     try:
-        data = json.loads(site_json.read_text())
-    except (json.JSONDecodeError, OSError):
+        lines = event_path.read_text().splitlines()
+    except OSError:
         return {}, {}
+    assigned = None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "job.assigned":
+            assigned = event
+    if assigned is None:
+        return {}, {}
+    data = {k: v for k, v in assigned.items() if k not in _EVENT_ENVELOPE_KEYS}
     site_keys = {"hostname", "slot", "gpu_model", "gpu_count", "gpu_id"}
     site_info = {k: v for k, v in data.items() if k in site_keys}
     env_info = {k: v for k, v in data.items() if k not in site_keys}
@@ -141,7 +161,7 @@ def scan_once(
         return
 
     csv_metrics = _read_metrics_csv(watch_dir)
-    site_info, env_info = _load_site_info(watch_dir)
+    site_info, env_info = _load_site_info()
 
     parent_hash: str | None = None
     prev_time: float | None = start_time
@@ -232,7 +252,7 @@ def watch_and_emit(
         new_files = _sorted_by_mtime(list(current - seen))
 
         for ckpt_path in new_files:
-            site_info, env_info = _load_site_info(watch_dir)
+            site_info, env_info = _load_site_info()
             epoch_start = time.time()
 
             emit_event(
