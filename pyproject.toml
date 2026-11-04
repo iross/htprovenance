@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "htprovenance"
-version = "0.1.0rc1"
+version = "0.1.0rc2"
 description = "Provenance capture and querying for HTCondor jobs and the artifacts they produce"
 readme = "README.md"
 requires-python = ">=3.9"

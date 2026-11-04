@@ -12,7 +12,6 @@ Default log_dir:    output/provenance
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +36,8 @@ VALID_EVENT_TYPES: frozenset[str] = frozenset({
     "job.failed",
     "job.completed",
     "job.resource_usage",
+    "dagman.started",
+    "service.started",
 })
 
 _DEFAULT_LOG_DIR = "output/provenance"

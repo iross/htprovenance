@@ -33,7 +33,9 @@ database keyed by `(cluster_id, proc_id)`:
   Python environment, a `.pth` hook fires at interpreter startup, detects
   `$_CONDOR_JOB_AD`, and records site/hardware/software context plus the job's
   submit-time ClassAd attributes — no code required in the training script. See
-  `htprovenance/autocapture.py`.
+  `htprovenance/autocapture.py`. On the access point, DAGMan and its `SERVICE`
+  nodes are recorded as `dagman.started` / `service.started` in
+  `dagman-<DAGMan cluster>.ndjson` instead.
 - **After the fact.** `htprovenance-query db enrich-history` backfills from
   `condor_history`; `htprovenance-query db enrich-jobad` mirrors the in-job
   capture into the same table; a raw event log can be scanned directly for jobs
