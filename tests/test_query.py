@@ -174,3 +174,45 @@ def test_cli_events_json_output(tmp_path):
 def test_cli_events_missing_run_exits_nonzero(tmp_path):
     result = runner.invoke(app, ["events", "no-such-run", "--log-dir", str(tmp_path)])
     assert result.exit_code != 0
+
+
+# --- scan --db / --schedd ---
+
+_EXECUTING_ONLY_LOG = (
+    "001 (322.000.000) 2026-11-04 15:54:00 Job executing on host: <10.0.0.1:1234>\n...\n"
+)
+
+
+def test_cli_scan_db_without_schedd_exits_nonzero_and_writes_nothing(tmp_path):
+    log = tmp_path / "batch.log"
+    log.write_text(_EXECUTING_ONLY_LOG)
+    db_path = tmp_path / "provenance.db"
+
+    result = runner.invoke(app, ["scan", str(log), "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "--schedd" in result.output
+    assert not db_path.exists() or _condor_history_rows(db_path) == []
+
+
+def test_cli_scan_db_with_schedd_writes_row(tmp_path):
+    log = tmp_path / "batch.log"
+    log.write_text(_EXECUTING_ONLY_LOG)
+    db_path = tmp_path / "provenance.db"
+
+    result = runner.invoke(
+        app, ["scan", str(log), "--db", str(db_path), "--schedd", "ap2002.chtc.wisc.edu"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _condor_history_rows(db_path) == [("ap2002.chtc.wisc.edu", 322, 0)]
+
+
+def _condor_history_rows(db_path: Path) -> list[tuple]:
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT schedd, cluster_id, proc_id FROM condor_history").fetchall()
+    finally:
+        conn.close()

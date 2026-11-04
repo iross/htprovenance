@@ -249,6 +249,13 @@ def scan(
         Optional[list[int]],  # noqa: UP045 -- see db_build's Optional[list[str]] for why
         typer.Option(help="Only include this cluster_id; repeatable to filter to a specific set"),
     ] = None,
+    schedd: Annotated[
+        Optional[str],  # noqa: UP045
+        typer.Option(
+            help="Schedd name to record for every job, overriding the one read from the log's "
+                 "submit events. Needed for --db when the log doesn't name the schedd"
+        ),
+    ] = None,
     db: Annotated[
         Optional[str],  # noqa: UP045
         typer.Option(help="Write results into this provenance.db's condor_history table (source='event_log')"),
@@ -262,7 +269,11 @@ def scan(
     happens when log_dir/provenance_log_dir actually have matching data.
     """
     records = scan_event_log(
-        log_file, log_dir=log_dir, provenance_log_dir=provenance_log_dir, cluster_ids=cluster_id
+        log_file,
+        log_dir=log_dir,
+        provenance_log_dir=provenance_log_dir,
+        cluster_ids=cluster_id,
+        schedd=schedd,
     )
     if json_out:
         typer.echo(json.dumps(records, indent=2))
@@ -273,7 +284,11 @@ def scan(
     if db:
         from htprovenance.history_enrich import write_scan_records
 
-        written = write_scan_records(db, records)
+        try:
+            written = write_scan_records(db, records)
+        except ValueError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(1) from exc
         typer.echo(f"Wrote {written} row(s) to {db} (condor_history, source=event_log)")
 
 
@@ -351,6 +366,13 @@ def db_enrich_history(
 @db_app.command("enrich-jobad")
 def db_enrich_jobad(
     db: Annotated[str, typer.Option(help="Path to the SQLite database file")] = DEFAULT_DB_PATH,
+    schedd: Annotated[
+        Optional[str],  # noqa: UP045
+        typer.Option(
+            help="Schedd name for job.assigned events that don't record one (captured before "
+                 "schedd was recorded); without it those events are skipped"
+        ),
+    ] = None,
 ) -> None:
     """Mirror job.assigned events (jobad.py's in-job $_CONDOR_JOB_AD capture) into condor_history.
 
@@ -361,7 +383,7 @@ def db_enrich_jobad(
     """
     from htprovenance.history_enrich import enrich_from_jobad_events
 
-    written = enrich_from_jobad_events(db)
+    written = enrich_from_jobad_events(db, default_schedd=schedd)
     typer.echo(f"Wrote {written} row(s) to {db} (condor_history, source=jobad)")
 
 

@@ -22,7 +22,7 @@ plotting/dataframe stack that DAG generation and reporting need.
 ## What it does
 
 Provenance is captured from three independent places and merged into one SQLite
-database keyed by `(cluster_id, proc_id)`:
+database keyed by `(schedd, cluster_id, proc_id)`:
 
 - **Submit side.** `htprovenance-pre` / `htprovenance-post` run as DAGMan
   `SCRIPT PRE`/`POST` and emit `job.submitted` / `job.completed` / `job.failed`
@@ -122,6 +122,9 @@ htprovenance-query scan metl.log --cluster-id 12345 --cluster-id 12399
 # instead of/alongside printing them
 htprovenance-query scan metl.log --db provenance.db
 
+# Same, naming the schedd when the log doesn't (see below)
+htprovenance-query scan metl.log --db provenance.db --schedd ap2002.chtc.wisc.edu
+
 # Backfill provenance.db's condor_history table from HTCondor job history
 # (final host, exit code, hold reasons, requested vs. used resources)
 htprovenance-query db enrich-history --schedd <name>
@@ -129,20 +132,32 @@ htprovenance-query db enrich-history --schedd <name>
 # Mirror job.assigned events (jobad.py's in-job $_CONDOR_JOB_AD capture,
 # emitted immediately at job start) into condor_history too
 htprovenance-query db enrich-jobad
+
+# Include job.assigned events captured before the schedd was recorded
+htprovenance-query db enrich-jobad --schedd ap2002.chtc.wisc.edu
 ```
 
 `scan` parses any HTCondor event log directly; if `--log-dir`/
 `--provenance-log-dir` happen to point at a DAGMan provenance run's classad or
 NDJSON directories, matching jobs are enriched with `run_id`/`job_name` too.
-Jobs are keyed by `(cluster_id, proc_id)`, not `cluster_id` alone, since a
-`queue N` job array puts many procs under one cluster.
+Jobs are keyed by `(schedd, cluster_id, proc_id)`: a `queue N` job array puts
+many procs under one cluster, and a `ClusterId` is only unique per schedd, so
+one database can hold jobs from several access points.
+
+`scan` takes the schedd from the `alias=` host name in each job's submit event
+(`Job submitted from host: <...&alias=ap2002.chtc.wisc.edu&...>`), which is the
+schedd's name for a default schedd. `--schedd` sets it for every job instead.
+Use it when the log has no submit events or no alias, or when your schedd's
+name differs from its host name; otherwise `scan` and `enrich-history` rows
+for the same job won't merge. `scan --db` refuses to write when any job is
+left without a schedd.
 
 `condor_history` holds rows from any of three sources — `db enrich-history`
 (queried from HTCondor), `scan --db` (parsed from a raw event log), or
 `db enrich-jobad` (mirrored from `job.assigned` events already in the `events`
 table) — distinguished by its `source` column, since they can disagree and
 none is definitively more current than the others. Writing from more than one
-for the same `(cluster_id, proc_id)` never produces duplicate rows or a
+for the same `(schedd, cluster_id, proc_id)` never produces duplicate rows or a
 clobber: a write merges column-by-column into any existing row (a column the
 new write doesn't know about keeps its previous value), and `source` becomes
 e.g. `condor_history,jobad` once both have contributed. `enrich-jobad`
@@ -152,9 +167,15 @@ so those fields would be near-zero placeholders rather than real usage — use
 `enrich-history` or `scan` for those.
 
 `db enrich-history` queries `condor_history` via the HTCondor Python bindings
-(not the CLI) for every cluster_id already in `provenance.db`'s `events`
-table, and is safe to re-run — already-enriched cluster_ids are skipped
+(not the CLI) for every cluster_id already in `provenance.db` that belongs to
+the schedd being queried: recorded on that schedd, or recorded with no schedd
+at all (`log_monitor` events and older `job.assigned` events carry none). It
+is safe to re-run — cluster_ids already enriched from that schedd are skipped
 unless `--full-rescan` is passed. Requires `htcondor2` (Linux only).
+
+`job.assigned` events record the schedd from `GlobalJobId`. Events captured
+before that have none; `enrich-jobad` skips them with a warning unless
+`--schedd` supplies one.
 
 ## Relationship to mldag
 

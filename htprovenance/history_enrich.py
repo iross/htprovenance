@@ -5,12 +5,15 @@ post.py) never sees: final Owner, the exact RemoteHost/LastRemoteHost,
 ExitCode, and the originally requested resources alongside what was actually
 used. Three entry points write into the same `condor_history` table, tagged
 by `source`, merging rather than overwriting when more than one applies to
-the same (cluster_id, proc_id) -- see db.py's condor_history docstring and
-_upsert_history_row:
+the same (schedd, cluster_id, proc_id) -- see db.py's condor_history
+docstring and _upsert_history_row. Every row needs a schedd, since
+ClusterIds are only unique per access point:
 
   enrich_from_condor_history() -- queries condor_history via the HTCondor
       Python bindings (Schedd.history, not the condor_history CLI) for
-      cluster_ids already present in provenance.db's `events` table.
+      cluster_ids already known to provenance.db that belong to the schedd
+      being queried (or have no recorded schedd). The row's schedd comes
+      from the ad's GlobalJobId.
       htcondor2 is a Linux-only dependency (see pyproject.toml) -- this
       module is only importable where it's installed, which is why query.py's
       CLI wiring imports it lazily inside the command body rather than at
@@ -22,14 +25,15 @@ _upsert_history_row:
 
   write_scan_records() -- writes htprovenance.event_log_scan.scan_event_log()'s
       output (parsed directly from a raw HTCondor event log; no condor_history
-      query needed).
+      query needed). Every record must carry a schedd.
 
   enrich_from_jobad_events() -- mirrors job.assigned events (jobad.py's in-job
       $_CONDOR_JOB_AD capture, emitted immediately at job start -- see
       pretrain_local.sh) that are already in provenance.db's `events` table.
       Deliberately excludes wall_time_s/cpu_usage/peak_memory_mb/gpu_usage:
       the job ad is captured before the job has run, so those fields would be
-      near-zero placeholders, not real usage.
+      near-zero placeholders, not real usage. Events recorded before
+      job.assigned carried a schedd need one supplied by the caller.
 
 The ClassAd's Environment attribute is never stored, even in the raw
 condor_history_json blob: it's where secrets like WANDB_API_KEY live (see
@@ -49,7 +53,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from htprovenance.db import _init_schema
-from htprovenance.post import _SENSITIVE_AD_KEYS, run_id_from_classad
+from htprovenance.post import (
+    _SENSITIVE_AD_KEYS,
+    run_id_from_classad,
+    schedd_from_global_job_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,14 +98,14 @@ _FIELD_MAPPING = {
 
 # Environment is projected (to recover run_id) but is never stored -- see
 # module docstring -- so it's kept out of _FIELD_MAPPING's column mapping.
-_PROJECTION = list(dict.fromkeys(["ClusterId", "Environment", *_FIELD_MAPPING]))
+_PROJECTION = list(dict.fromkeys(["ClusterId", "Environment", "GlobalJobId", *_FIELD_MAPPING]))
 
 # job_name/site/gpu_ids are event-log-only fields (event_log_scan.py); status
 # is populated by both sources but from different vocabularies (see
 # _JOB_STATUS_TO_STATUS / event_log_scan._status) -- the `source` column says
 # which applies to a given row.
 _HISTORY_COLUMNS = [
-    *_FIELD_MAPPING.values(), "run_id", "job_name", "site", "gpu_ids", "status",
+    "schedd", *_FIELD_MAPPING.values(), "run_id", "job_name", "site", "gpu_ids", "status",
     "source", "condor_history_json", "event_log_json", "jobad_json", "queried_at",
 ]
 
@@ -117,6 +125,7 @@ _JOB_STATUS_TO_STATUS = {
 
 # event_log_scan.py record field -> condor_history column name.
 _SCAN_FIELD_MAPPING = {
+    "schedd": "schedd",
     "cluster_id": "cluster_id",
     "proc_id": "proc_id",
     "run_id": "run_id",
@@ -139,6 +148,7 @@ _SCAN_FIELD_MAPPING = {
 # submission, before the job has run, so those would be near-zero
 # placeholders -- see the condor_history table's docstring in db.py.
 _JOBAD_FIELD_MAPPING = {
+    "schedd": "schedd",
     "cluster_id": "cluster_id",
     "proc_id": "proc_id",
     "run_id": "run_id",
@@ -183,32 +193,42 @@ def _chunks(seq: list, size: int):
         yield seq[i : i + size]
 
 
-def _all_known_cluster_ids(conn: sqlite3.Connection) -> set[int]:
-    """Return every cluster_id known to db_path, from either the `events`
-    table (built by `db build` from NDJSON -- the DAGMan-instrumented path)
-    or condor_history itself (rows already written by scan --db/enrich-jobad
-    for jobs that never went through NDJSON at all).
+def _known_cluster_ids(conn: sqlite3.Connection, schedd_name: str) -> set[int]:
+    """Return the cluster_ids known to the db that belong to schedd_name.
 
-    Without the condor_history half of this, a provenance.db populated
-    purely via `scan --db` (a batch of jobs with no DAGMan instrumentation,
-    so an empty or nonexistent `events` table) would give enrich-history
-    nothing to discover, even though those exact jobs are sitting right
-    there in condor_history waiting to be enriched further.
+    Sources: the `events` table (built by `db build` from NDJSON) and
+    condor_history itself (rows already written by scan --db/enrich-jobad
+    for jobs that never went through NDJSON at all). Without the
+    condor_history half, a provenance.db populated purely via `scan --db`
+    would give enrich-history nothing to discover.
+
+    A cluster_id counts as schedd_name's when its recorded schedd matches,
+    or when no schedd was recorded: log_monitor's events and job.assigned
+    events from before schedd was captured carry none, and they are assumed
+    to belong to whichever schedd is being queried, as before.
     """
     from_events = conn.execute(
-        "SELECT DISTINCT CAST(json_extract(payload_json, '$.cluster_id') AS INTEGER) "
+        "SELECT DISTINCT json_extract(payload_json, '$.schedd'), "
+        "CAST(json_extract(payload_json, '$.cluster_id') AS INTEGER) "
         "FROM events WHERE json_extract(payload_json, '$.cluster_id') IS NOT NULL"
     )
-    from_condor_history = conn.execute("SELECT DISTINCT cluster_id FROM condor_history")
-    return {row[0] for row in from_events} | {row[0] for row in from_condor_history}
+    from_condor_history = conn.execute("SELECT DISTINCT schedd, cluster_id FROM condor_history")
+    return {
+        cluster_id
+        for schedd, cluster_id in [*from_events, *from_condor_history]
+        if schedd is None or schedd == schedd_name
+    }
 
 
-def _row_from_ad(ad: dict) -> dict:
+def _row_from_ad(ad: dict, queried_schedd: str) -> dict:
     """Map a condor_history ClassAd (as a plain dict) to a condor_history table row.
 
-    Never includes the raw Environment attribute -- see module docstring.
+    schedd comes from the ad's GlobalJobId, falling back to the name of the
+    schedd that was queried. Never includes the raw Environment attribute --
+    see module docstring.
     """
     row = {column: ad[ad_key] for ad_key, column in _FIELD_MAPPING.items() if ad_key in ad}
+    row["schedd"] = schedd_from_global_job_id(ad.get("GlobalJobId", "")) or queried_schedd
     run_id = run_id_from_classad(ad)
     row["run_id"] = run_id if run_id != "unknown" else None
     row["status"] = _JOB_STATUS_TO_STATUS.get(row.get("job_status"))
@@ -236,7 +256,22 @@ def write_scan_records(db_path: str | Path, records: list[dict]) -> int:
 
     Returns:
         Number of rows written.
+
+    Raises:
+        ValueError: if any record has no schedd. Nothing is written in that
+            case: a row keyed without its schedd could never merge with
+            enrich-history's rows for the same job.
     """
+    missing = sorted(
+        f"{rec.get('cluster_id')}.{rec.get('proc_id')}" for rec in records if not rec.get("schedd")
+    )
+    if missing:
+        shown = ", ".join(missing[:5]) + (" ..." if len(missing) > 5 else "")
+        raise ValueError(
+            f"{len(missing)} scan record(s) have no schedd (jobs {shown}); the event log "
+            "didn't name the submitting schedd. Pass the schedd name explicitly "
+            "(scan --schedd <name>)."
+        )
     now = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(db_path)
     try:
@@ -257,7 +292,7 @@ def _row_from_jobad_event(event: dict) -> dict:
     return row
 
 
-def enrich_from_jobad_events(db_path: str | Path) -> int:
+def enrich_from_jobad_events(db_path: str | Path, *, default_schedd: str | None = None) -> int:
     """Mirror job.assigned events (jobad.py's in-job $_CONDOR_JOB_AD capture) into condor_history.
 
     job.assigned is emitted immediately from within the running job (see
@@ -276,8 +311,14 @@ def enrich_from_jobad_events(db_path: str | Path) -> int:
     see event_log_scan.py's job-array handling for the one case where that
     assumption doesn't hold).
 
+    job.assigned events only carry a schedd when they were captured from a
+    job ad with a GlobalJobId by a version that records it. For older events,
+    default_schedd is used; without one they are skipped and counted in a
+    warning, since a condor_history row needs a schedd.
+
     Args:
         db_path: Path to the provenance SQLite database (see htprovenance.db).
+        default_schedd: Schedd name for events that don't record one.
 
     Returns:
         Number of rows written.
@@ -297,6 +338,7 @@ def enrich_from_jobad_events(db_path: str | Path) -> int:
             "SELECT run_id, payload_json FROM events WHERE type = 'job.assigned'"
         ).fetchall()
         count = 0
+        no_schedd = 0
         for run_id, payload_json in rows:
             event = json.loads(payload_json)
             if "cluster_id" not in event:
@@ -305,6 +347,11 @@ def enrich_from_jobad_events(db_path: str | Path) -> int:
                     continue
                 event["cluster_id"] = cluster_id
             event.setdefault("proc_id", 0)
+            if not event.get("schedd"):
+                if default_schedd is None:
+                    no_schedd += 1
+                    continue
+                event["schedd"] = default_schedd
             row = _row_from_jobad_event(event)
             row["queried_at"] = now
             _upsert_history_row(conn, row)
@@ -312,16 +359,24 @@ def enrich_from_jobad_events(db_path: str | Path) -> int:
         conn.commit()
     finally:
         conn.close()
+    if no_schedd:
+        logger.warning(
+            "Skipped %d job.assigned event(s) that record no schedd; rerun with "
+            "enrich-jobad --schedd <name> to mirror them.",
+            no_schedd,
+        )
     return count
 
 
 _MERGE_COLUMNS = [
-    c for c in _HISTORY_COLUMNS if c not in ("cluster_id", "proc_id", "source", "queried_at")
+    c
+    for c in _HISTORY_COLUMNS
+    if c not in ("schedd", "cluster_id", "proc_id", "source", "queried_at")
 ]
 
 
 def _upsert_history_row(conn: sqlite3.Connection, row: dict) -> None:
-    """Insert row, or merge it into an existing (cluster_id, proc_id) row.
+    """Insert row, or merge it into an existing (schedd, cluster_id, proc_id) row.
 
     A merge is column-by-column COALESCE(new, existing): a column this write
     doesn't know about keeps whatever value was already there, rather than
@@ -333,10 +388,15 @@ def _upsert_history_row(conn: sqlite3.Connection, row: dict) -> None:
     row = {**dict.fromkeys(_HISTORY_COLUMNS), **row}
     new_source = row["source"]
     assert isinstance(new_source, str), "_row_from_ad/_row_from_scan_record always set source"
+    if not row["schedd"]:
+        raise ValueError(
+            f"condor_history row for {row['cluster_id']}.{row['proc_id']} "
+            f"(source={new_source}) has no schedd"
+        )
 
     existing = conn.execute(
-        "SELECT source FROM condor_history WHERE cluster_id = ? AND proc_id = ?",
-        (row["cluster_id"], row["proc_id"]),
+        "SELECT source FROM condor_history WHERE schedd = ? AND cluster_id = ? AND proc_id = ?",
+        (row["schedd"], row["cluster_id"], row["proc_id"]),
     ).fetchone()
     if existing and existing[0]:
         row["source"] = ",".join(sorted({*existing[0].split(","), new_source}))
@@ -349,7 +409,7 @@ def _upsert_history_row(conn: sqlite3.Connection, row: dict) -> None:
     conn.execute(
         f"""
         INSERT INTO condor_history ({columns}) VALUES ({placeholders})
-        ON CONFLICT (cluster_id, proc_id) DO UPDATE SET
+        ON CONFLICT (schedd, cluster_id, proc_id) DO UPDATE SET
             {merge_clause},
             source = excluded.source,
             queried_at = excluded.queried_at
@@ -359,18 +419,49 @@ def _upsert_history_row(conn: sqlite3.Connection, row: dict) -> None:
 
 
 def _get_schedd(schedd_name: str | None, pool: str | None):
-    """Return an htcondor2.Schedd for schedd_name, or the local schedd if unset."""
+    """Return (htcondor2.Schedd, its name) for schedd_name, or the local schedd if unset.
+
+    The name is needed up front to decide which of the db's cluster_ids belong
+    to this schedd, so even the local schedd is located through the collector
+    to read its Name.
+    """
     import htcondor2 as htcondor
 
+    collector = htcondor.Collector(pool) if pool else htcondor.Collector()
     if schedd_name:
-        collector = htcondor.Collector(pool) if pool else htcondor.Collector()
         location_ad = collector.locate(htcondor.DaemonTypes.Schedd, schedd_name)
-        return htcondor.Schedd(location_ad)
-    return htcondor.Schedd()
+    else:
+        location_ad = collector.locate(htcondor.DaemonTypes.Schedd)
+    return htcondor.Schedd(location_ad), location_ad["Name"]
 
 
 def _noop_progress(_msg: str) -> None:
     pass
+
+
+def _target_cluster_ids(
+    conn: sqlite3.Connection, schedd_name: str, full_rescan: bool, stats: EnrichStats
+) -> list[int]:
+    """Return schedd_name's cluster_ids to query, recording skips in stats.already_enriched.
+
+    "Already enriched" is scoped to source='condor_history' rows on this
+    schedd (not "any row exists"): a cluster_id touched only by scan --db or
+    enrich-jobad was never actually condor_history-queried.
+    """
+    all_ids = _known_cluster_ids(conn, schedd_name)
+    if full_rescan:
+        return sorted(all_ids)
+    existing = {
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT cluster_id FROM condor_history "
+            "WHERE schedd = ? AND ',' || source || ',' LIKE '%,condor_history,%'",
+            (schedd_name,),
+        )
+    }
+    target_ids = sorted(all_ids - existing)
+    stats.already_enriched = len(all_ids) - len(target_ids)
+    return target_ids
 
 
 def enrich_from_condor_history(
@@ -382,19 +473,22 @@ def enrich_from_condor_history(
     full_rescan: bool = False,
     on_progress: Callable[[str], None] | None = None,
 ) -> EnrichStats:
-    """Backfill db_path's condor_history table for every cluster_id known to it,
-    whether from its events table (NDJSON) or condor_history itself (rows
-    already written by scan --db/enrich-jobad).
+    """Backfill db_path's condor_history table for the queried schedd's cluster_ids.
+
+    cluster_ids come from the events table (NDJSON) and condor_history itself
+    (rows already written by scan --db/enrich-jobad), restricted to those
+    recorded on this schedd or recorded with no schedd -- see
+    _known_cluster_ids.
 
     Args:
         db_path: Path to the provenance SQLite database (see htprovenance.db).
         schedd_name: Name of the schedd to query, as HTCondor's collector knows
             it. Defaults to the local schedd.
-        pool: Collector address to resolve schedd_name against. Only used
-            when schedd_name is given; defaults to the local pool.
+        pool: Collector address to locate the schedd through; defaults to
+            the local pool.
         batch_size: How many cluster_ids to fold into one condor_history
             constraint query.
-        full_rescan: Re-query every cluster_id in the events table, including
+        full_rescan: Re-query every one of this schedd's cluster_ids, including
             ones already in condor_history, ignoring recorded results.
         on_progress: Optional callback invoked with a one-line status message
             before the first query and after each batch completes -- a batch
@@ -415,23 +509,8 @@ def enrich_from_condor_history(
     conn = sqlite3.connect(db_path)
     try:
         _init_schema(conn)
-        all_ids = _all_known_cluster_ids(conn)
-        if full_rescan:
-            target_ids = sorted(all_ids)
-        else:
-            # Scoped to source='condor_history' (not "any row exists"): a
-            # cluster_id touched only by scan --db (source='event_log') was
-            # never actually condor_history-queried, so it isn't "already
-            # enriched" from this function's point of view.
-            existing = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT DISTINCT cluster_id FROM condor_history "
-                    "WHERE ',' || source || ',' LIKE '%,condor_history,%'"
-                )
-            }
-            target_ids = sorted(all_ids - existing)
-            stats.already_enriched = len(all_ids) - len(target_ids)
+        schedd, resolved_schedd_name = _get_schedd(schedd_name, pool)
+        target_ids = _target_cluster_ids(conn, resolved_schedd_name, full_rescan, stats)
 
         if not target_ids:
             on_progress("No new cluster_ids to enrich.")
@@ -439,11 +518,10 @@ def enrich_from_condor_history(
 
         batches = list(_chunks(target_ids, batch_size))
         on_progress(
-            f"Querying condor_history for {len(target_ids)} cluster_id(s) "
-            f"in {len(batches)} batch(es) of up to {batch_size}..."
+            f"Querying condor_history on {resolved_schedd_name} for {len(target_ids)} "
+            f"cluster_id(s) in {len(batches)} batch(es) of up to {batch_size}..."
         )
 
-        schedd = _get_schedd(schedd_name, pool)
         for batch_num, batch in enumerate(batches, start=1):
             constraint = " || ".join(f"ClusterId == {cid}" for cid in batch)
             batch_started = time.monotonic()
@@ -472,7 +550,7 @@ def enrich_from_condor_history(
                     continue
                 cluster_id = int(cluster_id)
                 found.add(cluster_id)
-                row = _row_from_ad(ad_dict)
+                row = _row_from_ad(ad_dict, resolved_schedd_name)
                 row["queried_at"] = now
                 _upsert_history_row(conn, row)
                 stats.enriched += 1

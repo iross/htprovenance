@@ -426,11 +426,49 @@ def test_build_database_leaves_current_condor_history_schema_alone(tmp_path):
 
     db_path = tmp_path / "provenance.db"
     build_database(db_path, [], [])
-    write_scan_records(db_path, [{"cluster_id": 500, "proc_id": 0, "status": "held"}])
+    write_scan_records(
+        db_path, [{"schedd": "ap1", "cluster_id": 500, "proc_id": 0, "status": "held"}]
+    )
 
     build_database(db_path, [], [])  # a second build must not wipe it out
 
     assert _query(db_path, "SELECT cluster_id, proc_id FROM condor_history") == [(500, 0)]
+
+
+_PRE_SCHEDD_CONDOR_HISTORY_SCHEMA = """
+CREATE TABLE condor_history (
+    cluster_id            INTEGER NOT NULL,
+    proc_id               INTEGER NOT NULL DEFAULT 0,
+    machine               TEXT,
+    glidein_resource_name TEXT,
+    job_batch_name        TEXT,
+    source                TEXT NOT NULL,
+    queried_at            TEXT NOT NULL,
+    PRIMARY KEY (cluster_id, proc_id)
+);
+"""
+
+
+def test_build_database_recreates_condor_history_keyed_without_schedd(tmp_path):
+    """A table from before schedd joined the key has every other current column,
+    so only the schedd check catches it."""
+    db_path = tmp_path / "provenance.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(_PRE_SCHEDD_CONDOR_HISTORY_SCHEMA)
+    conn.execute(
+        "INSERT INTO condor_history (cluster_id, proc_id, source, queried_at) "
+        "VALUES (123, 0, 'event_log', '2026-01-01T00:00:00Z')"
+    )
+    conn.commit()
+    conn.close()
+
+    build_database(db_path, [], [])
+
+    conn = sqlite3.connect(db_path)
+    key = [row[1] for row in conn.execute("PRAGMA table_info(condor_history)") if row[5]]
+    conn.close()
+    assert key == ["schedd", "cluster_id", "proc_id"]
+    assert _query(db_path, "SELECT COUNT(*) FROM condor_history") == [(0,)]
 
 
 def test_build_stats_str_reports_all_counts():

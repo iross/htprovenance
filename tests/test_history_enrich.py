@@ -16,6 +16,9 @@ from htprovenance.history_enrich import (
     write_scan_records,
 )
 
+# Name the fake _get_schedd reports for the schedd being queried.
+SCHEDD = "ap-test.example.edu"
+
 
 def _write_event(prov_dir: Path, filename: str, events: list[dict]) -> Path:
     prov_dir.mkdir(parents=True, exist_ok=True)
@@ -27,7 +30,13 @@ def _write_event(prov_dir: Path, filename: str, events: list[dict]) -> Path:
 def _seed_jobad_event(tmp_path: Path, run_id: str, filename: str, **fields) -> Path:
     """Write a job.assigned event (as jobad.py/pretrain_local.sh would) and build it into a db."""
     prov_dir = tmp_path / "provenance"
-    event = {"type": "job.assigned", "run_id": run_id, "ts": "2026-06-01T00:00:00Z", **fields}
+    event = {
+        "type": "job.assigned",
+        "run_id": run_id,
+        "ts": "2026-06-01T00:00:00Z",
+        "schedd": SCHEDD,
+        **fields,
+    }
     _write_event(prov_dir, filename, [event])
     db_path = tmp_path / "provenance.db"
     build_database(db_path, [], [prov_dir])
@@ -106,7 +115,7 @@ def test_enrich_inserts_rows_for_new_cluster_ids(tmp_path, monkeypatch):
     db_path = _seed_db(tmp_path, [100, 200])
     schedd = _FakeSchedd({100: _ad(100), 200: _ad(200)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     stats = enrich_from_condor_history(db_path)
@@ -121,7 +130,7 @@ def test_enrich_on_progress_reports_batches(tmp_path, monkeypatch):
     db_path = _seed_db(tmp_path, [100, 200])
     schedd = _FakeSchedd({100: _ad(100), 200: _ad(200)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     messages = []
 
@@ -137,7 +146,7 @@ def test_enrich_on_progress_reports_nothing_to_do(tmp_path, monkeypatch):
     build_database(db_path, [], [])
     schedd = _FakeSchedd({})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     messages = []
 
@@ -152,7 +161,7 @@ def test_enrich_without_on_progress_does_not_error(tmp_path, monkeypatch):
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: _ad(100)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     stats = enrich_from_condor_history(db_path)
@@ -165,7 +174,7 @@ def test_enrich_no_cluster_ids_in_events_is_a_noop(tmp_path, monkeypatch):
     build_database(db_path, [], [])
     schedd = _FakeSchedd({})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     stats = enrich_from_condor_history(db_path)
@@ -181,7 +190,7 @@ def test_environment_never_persisted_run_id_extracted(tmp_path, monkeypatch):
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: _ad(100, run_id="run-xyz")})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     enrich_from_condor_history(db_path)
@@ -202,7 +211,7 @@ def test_cluster_id_not_found_in_history_counted_not_error(tmp_path, monkeypatch
     db_path = _seed_db(tmp_path, [100, 200])
     schedd = _FakeSchedd({100: _ad(100)})  # 200 has no historical record
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     stats = enrich_from_condor_history(db_path)
@@ -217,7 +226,7 @@ def test_query_error_increments_stat_and_other_batches_still_run(tmp_path, monke
     db_path = _seed_db(tmp_path, [100, 200])
     schedd = _FakeSchedd({100: _ad(100), 200: _ad(200)}, raise_for={100})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     stats = enrich_from_condor_history(db_path, batch_size=1)
@@ -235,7 +244,7 @@ def test_already_enriched_cluster_ids_skipped_without_full_rescan(tmp_path, monk
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: _ad(100)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
     assert len(schedd.history_calls) == 1
@@ -251,7 +260,7 @@ def test_full_rescan_requeries_already_enriched_cluster_ids(tmp_path, monkeypatc
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: _ad(100)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
@@ -268,7 +277,7 @@ def test_job_array_stores_one_row_per_proc(tmp_path, monkeypatch):
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: [_ad(100, proc_id=0), _ad(100, proc_id=1), _ad(100, proc_id=2)]})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     stats = enrich_from_condor_history(db_path)
@@ -286,7 +295,7 @@ def test_second_run_skips_whole_cluster_once_any_proc_is_enriched(tmp_path, monk
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: [_ad(100, proc_id=0), _ad(100, proc_id=1)]})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
@@ -303,7 +312,7 @@ def test_condor_history_rows_tagged_source_and_status(tmp_path, monkeypatch):
     db_path = _seed_db(tmp_path, [100])
     schedd = _FakeSchedd({100: _ad(100, JobStatus=5)})  # 5 = Held
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     enrich_from_condor_history(db_path)
@@ -320,6 +329,7 @@ def test_write_scan_records_inserts_with_event_log_source(tmp_path):
     build_database(db_path, [], [])
     scan_records = [
         {
+            "schedd": SCHEDD,
             "cluster_id": 500,
             "proc_id": 0,
             "run_id": "run-scan",
@@ -347,11 +357,14 @@ def test_write_scan_records_coexists_with_condor_history_rows_for_other_procs(tm
     db_path = _seed_db(tmp_path, [600])
     schedd = _FakeSchedd({600: _ad(600, proc_id=0)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
-    write_scan_records(db_path, [{"cluster_id": 600, "proc_id": 1, "status": "held"}])
+    write_scan_records(
+        db_path,
+        [{"schedd": SCHEDD, "cluster_id": 600, "proc_id": 1, "status": "held"}],
+    )
 
     rows = _query(
         db_path, "SELECT proc_id, source FROM condor_history WHERE cluster_id = 600 ORDER BY proc_id"
@@ -367,12 +380,21 @@ def test_event_log_write_does_not_erase_condor_history_only_fields(tmp_path, mon
     db_path = _seed_db(tmp_path, [700])
     schedd = _FakeSchedd({700: _ad(700, Owner="iross", ExitCode=0, RequestCpus=4)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
     write_scan_records(
-        db_path, [{"cluster_id": 700, "proc_id": 0, "site": "gpu01.example.edu", "status": "completed"}]
+        db_path,
+        [
+            {
+                "schedd": SCHEDD,
+                "cluster_id": 700,
+                "proc_id": 0,
+                "site": "gpu01.example.edu",
+                "status": "completed",
+            }
+        ],
     )
 
     row = _query(
@@ -387,12 +409,21 @@ def test_condor_history_write_does_not_erase_event_log_only_fields(tmp_path, mon
     """Same as above, opposite write order."""
     db_path = _seed_db(tmp_path, [701])
     write_scan_records(
-        db_path, [{"cluster_id": 701, "proc_id": 0, "site": "gpu02.example.edu", "job_name": "run0-epoch0"}]
+        db_path,
+        [
+            {
+                "schedd": SCHEDD,
+                "cluster_id": 701,
+                "proc_id": 0,
+                "site": "gpu02.example.edu",
+                "job_name": "run0-epoch0",
+            }
+        ],
     )
 
     schedd = _FakeSchedd({701: _ad(701, Owner="iross")})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
@@ -407,7 +438,7 @@ def test_enrich_from_condor_history_captures_job_batch_name(tmp_path, monkeypatc
     db_path = _seed_db(tmp_path, [703])
     schedd = _FakeSchedd({703: _ad(703, JobBatchName="gb1-pretrain")})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
 
     enrich_from_condor_history(db_path)
@@ -423,7 +454,7 @@ def test_second_condor_history_write_updates_changed_fields(tmp_path, monkeypatc
     db_path = _seed_db(tmp_path, [702])
     schedd = _FakeSchedd({702: _ad(702, JobStatus=2)})  # running
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
@@ -522,7 +553,7 @@ def test_enrich_from_jobad_events_backfills_cluster_id_via_shared_run_id(tmp_pat
     db_path = tmp_path / "provenance.db"
     build_database(db_path, [], [prov_dir])
 
-    written = enrich_from_jobad_events(db_path)
+    written = enrich_from_jobad_events(db_path, default_schedd=SCHEDD)
 
     assert written == 1
     row = _query(
@@ -565,7 +596,7 @@ def test_enrich_from_jobad_events_merges_with_condor_history_row(tmp_path, monke
 
     schedd = _FakeSchedd({802: _ad(802, Owner="iross", ExitCode=0)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     enrich_from_condor_history(db_path)
 
@@ -582,12 +613,15 @@ def test_enrich_discovers_cluster_ids_from_scan_only_db_with_no_events_table(tmp
     with no DAGMan/NDJSON instrumentation at all, so an empty events table)
     must still be discoverable by enrich-history, not just events-table jobs."""
     db_path = tmp_path / "provenance.db"
-    write_scan_records(db_path, [{"cluster_id": 900, "proc_id": 0, "status": "completed"}])
+    write_scan_records(
+        db_path,
+        [{"schedd": SCHEDD, "cluster_id": 900, "proc_id": 0, "status": "completed"}],
+    )
     assert _query(db_path, "SELECT COUNT(*) FROM events") == [(0,)]
 
     schedd = _FakeSchedd({900: _ad(900)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     stats = enrich_from_condor_history(db_path)
 
@@ -599,14 +633,127 @@ def test_enrich_discovers_cluster_ids_from_scan_only_db_with_no_events_table(tmp
 def test_event_log_only_cluster_is_not_already_enriched_for_condor_history(tmp_path, monkeypatch):
     """A cluster touched only by scan --db was never condor_history-queried."""
     db_path = _seed_db(tmp_path, [703])
-    write_scan_records(db_path, [{"cluster_id": 703, "proc_id": 0, "status": "held"}])
+    write_scan_records(
+        db_path,
+        [{"schedd": SCHEDD, "cluster_id": 703, "proc_id": 0, "status": "held"}],
+    )
 
     schedd = _FakeSchedd({703: _ad(703)})
     monkeypatch.setattr(
-        "htprovenance.history_enrich._get_schedd", lambda *a, **k: schedd
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
     )
     stats = enrich_from_condor_history(db_path)
 
     assert stats.already_enriched == 0
     assert stats.enriched == 1
     assert len(schedd.history_calls) == 1
+
+
+# --- schedd ---
+
+
+def test_same_cluster_on_two_schedds_gives_two_rows(tmp_path):
+    db_path = tmp_path / "provenance.db"
+    build_database(db_path, [], [])
+
+    write_scan_records(
+        db_path,
+        [
+            {"schedd": "ap2001.chtc.wisc.edu", "cluster_id": 42, "proc_id": 0, "status": "held"},
+            {
+                "schedd": "ap2002.chtc.wisc.edu",
+                "cluster_id": 42,
+                "proc_id": 0,
+                "status": "completed",
+            },
+        ],
+    )
+
+    rows = _query(db_path, "SELECT schedd, status FROM condor_history ORDER BY schedd")
+    assert rows == [("ap2001.chtc.wisc.edu", "held"), ("ap2002.chtc.wisc.edu", "completed")]
+
+
+def test_write_scan_records_without_schedd_raises_and_writes_nothing(tmp_path):
+    db_path = tmp_path / "provenance.db"
+    build_database(db_path, [], [])
+
+    with pytest.raises(ValueError, match="--schedd"):
+        write_scan_records(
+            db_path,
+            [
+                {"schedd": SCHEDD, "cluster_id": 1, "proc_id": 0, "status": "held"},
+                {"cluster_id": 2, "proc_id": 0, "status": "held"},
+            ],
+        )
+
+    assert _query(db_path, "SELECT COUNT(*) FROM condor_history") == [(0,)]
+
+
+def test_enrich_queries_only_this_schedds_clusters(tmp_path, monkeypatch):
+    """Clusters recorded on another schedd are left alone; clusters with no
+    recorded schedd (e.g. log_monitor events) are assumed to be this one's."""
+    prov_dir = tmp_path / "provenance"
+    _write_event(
+        prov_dir,
+        "events.ndjson",
+        [
+            {"type": "job.assigned", "run_id": "a", "ts": "t", "schedd": "x", "cluster_id": 100},
+            {"type": "job.assigned", "run_id": "b", "ts": "t", "schedd": SCHEDD, "cluster_id": 200},
+            {"type": "job.executing", "run_id": "c", "ts": "t", "cluster_id": 300},
+        ],
+    )
+    db_path = tmp_path / "provenance.db"
+    build_database(db_path, [], [prov_dir])
+    schedd = _FakeSchedd({100: _ad(100), 200: _ad(200), 300: _ad(300)})
+    monkeypatch.setattr("htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD))
+
+    stats = enrich_from_condor_history(db_path)
+
+    assert stats.enriched == 2
+    assert not any("ClusterId == 100" in c for c in schedd.history_calls)
+    rows = _query(db_path, "SELECT schedd, cluster_id FROM condor_history ORDER BY cluster_id")
+    assert rows == [(SCHEDD, 200), (SCHEDD, 300)]
+
+
+def test_already_enriched_on_another_schedd_does_not_skip_this_one(tmp_path, monkeypatch):
+    db_path = _seed_db(tmp_path, [400])
+    schedd = _FakeSchedd({400: _ad(400)})
+    monkeypatch.setattr(
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, "other")
+    )
+    enrich_from_condor_history(db_path)
+    monkeypatch.setattr("htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD))
+
+    stats = enrich_from_condor_history(db_path)
+
+    assert stats.already_enriched == 0
+    assert stats.enriched == 1
+
+
+def test_enrich_takes_schedd_from_global_job_id(tmp_path, monkeypatch):
+    db_path = _seed_db(tmp_path, [500])
+    ad = _ad(500, GlobalJobId="ap2001.chtc.wisc.edu#500.0#1793900000")
+    schedd = _FakeSchedd({500: ad})
+    monkeypatch.setattr("htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD))
+
+    enrich_from_condor_history(db_path)
+
+    assert _query(db_path, "SELECT schedd FROM condor_history") == [("ap2001.chtc.wisc.edu",)]
+
+
+def test_enrich_from_jobad_events_skips_events_without_schedd(tmp_path, caplog):
+    prov_dir = tmp_path / "provenance"
+    _write_event(
+        prov_dir,
+        "old.ndjson",
+        [{"type": "job.assigned", "run_id": "old", "ts": "t", "cluster_id": 77, "proc_id": 0}],
+    )
+    db_path = tmp_path / "provenance.db"
+    build_database(db_path, [], [prov_dir])
+
+    written = enrich_from_jobad_events(db_path)
+
+    assert written == 0
+    assert "--schedd" in caplog.text
+    assert enrich_from_jobad_events(db_path, default_schedd="ap1") == 1
+    assert _query(db_path, "SELECT schedd, cluster_id FROM condor_history") == [("ap1", 77)]

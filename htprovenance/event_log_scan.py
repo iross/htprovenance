@@ -24,6 +24,14 @@ matching files, job never went through the provenance pipeline) is left keyed
 by bare cluster_id/proc_id, silently. Note run_id/.ad resolution is still
 cluster_id-keyed (matching how post.py/log_monitor.py write `<cluster_id>.ad`
 and `.run_id` files), so every proc in a cluster resolves to the same run_id.
+
+schedd: ClusterIds are only unique per schedd, and provenance.db's
+condor_history is keyed by (schedd, cluster_id, proc_id). The event log has
+no GlobalJobId, so the schedd is taken from the `alias=` host name in the
+submit event's "Job submitted from host: <...>" address, which matches the
+schedd's name for a default schedd. Callers can pass schedd explicitly to
+set or override it (needed when the log has no alias, or the schedd's name
+differs from its host name).
 """
 
 from __future__ import annotations
@@ -52,6 +60,12 @@ _JOB_HEADER_RE = re.compile(r"^(\d{3}) \((\d+)\.(\d+)\.\d+\)")
 _HELD_CODE = "012"
 _RELEASED_CODE = "013"
 _ABORTED_CODE = "009"
+
+# The submitting host's alias in a 000 event's address, e.g.
+#   000 (123.000.000) ... Job submitted from host:
+#       <128.104.100.44:9618?addrs=...&alias=ap2002.chtc.wisc.edu&noUDP&sock=schedd_1_2>
+# (one line in the log; wrapped here)
+_SUBMIT_ALIAS_RE = re.compile(r"Job submitted from host:\s*<[^>]*[?&]alias=([^&>]+)")
 
 
 def _parse_any_ts(header_line: str) -> str | None:
@@ -95,6 +109,11 @@ def _flush_block(
             if m:
                 rec["job_name"] = m.group(1)
                 break
+        for line in lines:
+            m = _SUBMIT_ALIAS_RE.search(line)
+            if m:
+                rec["schedd"] = m.group(1)
+                break
     elif code == "001":
         rec["executing_ts"] = ts
         for line in lines:
@@ -135,6 +154,7 @@ def scan_event_log(
     log_dir: str | Path | None = None,
     provenance_log_dir: str | Path | None = None,
     cluster_ids: list[int] | None = None,
+    schedd: str | None = None,
 ) -> list[dict]:
     """Summarize every job in log_path: duration, execute host/site, resource usage.
 
@@ -157,11 +177,14 @@ def scan_event_log(
             proc of a matching cluster_id is kept. All others are skipped
             without being parsed into a record at all. None (the default)
             scans every cluster_id in the log.
+        schedd: Optional schedd name to record on every job, overriding the
+            one read from the submit events. Without it, a job whose submit
+            event isn't in the log (or names no alias) has no "schedd".
 
     Returns:
         One dict per (cluster_id, proc_id) seen, sorted by cluster_id then
         proc_id, containing at least "cluster_id", "proc_id", and "status";
-        other keys ("run_id", "job_name", "site", "execute_host",
+        other keys ("schedd", "run_id", "job_name", "site", "execute_host",
         "executing_ts", "terminated_ts", "wall_time_s", "cpu_usage",
         "peak_memory_mb", "gpu_usage", "gpu_ids", "resource_name") are
         present only when resolved.
@@ -223,5 +246,7 @@ def scan_event_log(
 
     for rec in records.values():
         rec["status"] = _status(rec)
+        if schedd:
+            rec["schedd"] = schedd
 
     return [records[key] for key in sorted(records)]

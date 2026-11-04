@@ -328,3 +328,46 @@ def test_scan_cluster_ids_none_scans_everything(tmp_path):
     records = scan_event_log(log, cluster_ids=None)
 
     assert {r["cluster_id"] for r in records} == {100, 200}
+
+
+# --- schedd ---
+
+_SUBMIT_FROM_AP2002 = (
+    "000 (321.000.000) 2026-11-04 15:53:10 Job submitted from host: "
+    "<128.104.100.44:9618?addrs=128.104.100.44-9618&alias=ap2002.chtc.wisc.edu"
+    "&noUDP&sock=schedd_2051_8f3c>\n"
+    "...\n"
+)
+
+
+def test_scan_reads_schedd_from_submit_event_alias(tmp_path):
+    log = tmp_path / "batch.log"
+    _write(log, _SUBMIT_FROM_AP2002)
+
+    [record] = scan_event_log(log)
+
+    assert record["schedd"] == "ap2002.chtc.wisc.edu"
+
+
+def test_scan_schedd_argument_overrides_alias(tmp_path):
+    log = tmp_path / "batch.log"
+    _write(log, _SUBMIT_FROM_AP2002)
+
+    [record] = scan_event_log(log, schedd="ap2002-schedd")
+
+    assert record["schedd"] == "ap2002-schedd"
+
+
+def test_scan_no_schedd_without_alias_or_argument(tmp_path):
+    log = tmp_path / "batch.log"
+    _write(
+        log,
+        "000 (321.000.000) 2026-11-04 15:53:10 Job submitted from host: <128.104.100.44:9618>\n"
+        "...\n"
+        "001 (322.000.000) 2026-11-04 15:54:00 Job executing on host: <10.0.0.1:1234>\n"
+        "...\n",
+    )
+
+    records = scan_event_log(log)
+
+    assert [r.get("schedd") for r in records] == [None, None]
