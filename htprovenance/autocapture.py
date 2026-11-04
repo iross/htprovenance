@@ -13,6 +13,12 @@ Detection reuses $_CONDOR_JOB_AD, the same env var htprovenance.jobad
 already relies on to locate the job's ClassAd snapshot (see its module
 docstring) -- one detection signal, not two independently-drifting ones.
 
+Processes on the access point see $_CONDOR_JOB_AD too: DAGMan's PRE/POST
+scripts inherit DAGMan's own (scheduler-universe) ad, and SERVICE nodes run
+as local-universe jobs. Those are recorded as dagman.started /
+service.started under run_id dagman-<DAGMan cluster>, not as job.assigned,
+so they never pose as a training job.
+
 Idempotency: HTCondor keeps one job pinned to one sandbox directory for its
 whole lifetime, and a single job can start many Python interpreters (a
 wrapper script's own `python3 --version` probe, the training process itself,
@@ -39,8 +45,20 @@ from pathlib import Path
 
 from htprovenance.events import _DEFAULT_LOG_DIR, emit_event
 from htprovenance.jobad import capture_job_ad_fields
+from htprovenance.post import parse_classad
 
 _MARKER_FILENAME = ".htprovenance_autocapture_done"
+
+# Universes whose jobs run on the access point rather than an execute node.
+# Their child processes inherit $_CONDOR_JOB_AD too: DAGMan's PRE/POST scripts
+# see DAGMan's own ad, and a SERVICE node sees its local-universe ad. Those
+# are recorded per DAGMan instead of as a training job's job.assigned.
+_SCHEDULER_UNIVERSE = 7
+_LOCAL_UNIVERSE = 12
+_SUBMIT_HOST_EVENT_TYPES = {
+    _SCHEDULER_UNIVERSE: "dagman.started",
+    _LOCAL_UNIVERSE: "service.started",
+}
 
 _GPU_INFO_DEFAULTS = {"gpu_count": 0, "gpu_model": "none", "gpu_id": "none"}
 
@@ -58,6 +76,41 @@ def _run(cmd: list[str]) -> str:
 def detect_condor_job() -> bool:
     """Best-effort HTCondor-job detection via $_CONDOR_JOB_AD presence."""
     return bool(os.environ.get("_CONDOR_JOB_AD"))
+
+
+def _ad_int(ad: dict, key: str) -> int | None:
+    """Return an integer ClassAd attribute, or None if absent or not an integer.
+
+    Accepts "7810859.0"-style job IDs by keeping the cluster part.
+    """
+    value = ad.get(key)
+    if value is None:
+        return None
+    try:
+        return int(str(value).split(".")[0])
+    except ValueError:
+        return None
+
+
+def submit_host_capture_target(ad: dict) -> tuple[str, str, int | None] | None:
+    """Return (event_type, run_id, dagman_cluster_id) for an access-point job ad, or None.
+
+    DAGMan itself (scheduler universe) and its SERVICE nodes (local universe)
+    both go to dagman-<DAGMan cluster>, so one file holds everything captured
+    on the access point for one DAG run. A local-universe job not started by
+    DAGMan goes to local-<its own cluster>.
+    """
+    universe = _ad_int(ad, "JobUniverse")
+    if universe not in _SUBMIT_HOST_EVENT_TYPES:
+        return None
+    cluster_id = _ad_int(ad, "ClusterId")
+    event_type = _SUBMIT_HOST_EVENT_TYPES[universe]
+    if universe == _SCHEDULER_UNIVERSE:
+        return event_type, f"dagman-{cluster_id}", cluster_id
+    dagman_cluster_id = _ad_int(ad, "DAGManJobId")
+    if dagman_cluster_id is not None:
+        return event_type, f"dagman-{dagman_cluster_id}", dagman_cluster_id
+    return event_type, f"local-{cluster_id}", None
 
 
 def default_gpu_info() -> tuple[dict, str]:
@@ -157,44 +210,28 @@ def gather_env_info() -> dict:
 def capture_and_emit(
     *, gpu_info: dict | None = None, fields_file: str | Path | None = None
 ) -> dict | None:
-    """Best-effort: write site_info.json and emit job.assigned.
+    """Best-effort: record where this HTCondor job is running.
+
+    On an execute node, writes site_info.json and emits job.assigned under
+    $PROVENANCE_RUN_ID. For DAGMan and its SERVICE nodes on the access point,
+    emits dagman.started / service.started under dagman-<DAGMan cluster>
+    instead, without writing site_info.json or probing GPUs.
 
     Returns the emitted payload, or None if this isn't (detectably) an
-    HTCondor job, this job's sandbox was already captured (idempotency
-    marker), or capture failed for any reason -- callers don't need to check
-    the return value to stay safe; it's provided for callers that want to
-    inspect what was captured (e.g. tests, or a caller printing it for
-    debugging).
+    HTCondor job, this job was already captured (idempotency marker), or
+    capture failed for any reason -- callers don't need to check the return
+    value to stay safe; it's provided for callers that want to inspect what
+    was captured (e.g. tests, or a caller printing it for debugging).
     """
     try:
         if not detect_condor_job():
             return None
-        marker = Path(_MARKER_FILENAME)
-        if marker.exists():
-            return None
-
-        import json
-
-        run_id = os.environ.get("PROVENANCE_RUN_ID", "unknown")
+        ad = parse_classad(os.environ["_CONDOR_JOB_AD"])
         log_dir = Path(os.environ.get("PROVENANCE_LOG_DIR", _DEFAULT_LOG_DIR))
-
-        site_info, site_info_source = gather_site_info(gpu_info)
-        env_info = gather_env_info()
-        jobad_fields = capture_job_ad_fields(fields_file)
-
-        payload = {**site_info, **env_info, **jobad_fields}
-        Path("site_info.json").write_text(json.dumps(payload, indent=2))
-
-        emit_event(
-            "job.assigned",
-            run_id,
-            log_dir=log_dir,
-            source="execute_node_autocapture",
-            site_info_source=site_info_source,
-            **payload,
-        )
-        marker.write_text("")
-        return payload
+        target = submit_host_capture_target(ad)
+        if target is not None:
+            return _capture_submit_host(ad, target, log_dir, fields_file)
+        return _capture_execute_node(log_dir, gpu_info, fields_file)
     except Exception:  # noqa: BLE001 -- deliberately blind: AC#7's whole point
         # is that any failure here (best-effort) must never affect the
         # training job's own behavior, output, or exit code.
@@ -238,3 +275,48 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def _capture_execute_node(
+    log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
+) -> dict | None:
+    import json
+
+    marker = Path(_MARKER_FILENAME)
+    if marker.exists():
+        return None
+    run_id = os.environ.get("PROVENANCE_RUN_ID", "unknown")
+    site_info, site_info_source = gather_site_info(gpu_info)
+    payload = {**site_info, **gather_env_info(), **capture_job_ad_fields(fields_file)}
+    Path("site_info.json").write_text(json.dumps(payload, indent=2))
+    emit_event(
+        "job.assigned",
+        run_id,
+        log_dir=log_dir,
+        source="execute_node_autocapture",
+        site_info_source=site_info_source,
+        **payload,
+    )
+    marker.write_text("")
+    return payload
+
+
+def _capture_submit_host(
+    ad: dict, target: tuple[str, str, int | None], log_dir: Path, fields_file: str | Path | None
+) -> dict | None:
+    # DAGMan and its SERVICE nodes share the DAG directory, so each HTCondor
+    # job gets its own marker rather than the first one blocking the rest.
+    marker = Path(f"{_MARKER_FILENAME}.{_ad_int(ad, 'ClusterId')}")
+    if marker.exists():
+        return None
+    event_type, run_id, dagman_cluster_id = target
+    site_info, _ = gather_site_info(gpu_info={}, gpu_info_source="none")
+    payload = {
+        "hostname": site_info["hostname"],
+        **gather_env_info(),
+        **capture_job_ad_fields(fields_file),
+        "dagman_cluster_id": dagman_cluster_id,
+    }
+    emit_event(event_type, run_id, log_dir=log_dir, source="submit_host_autocapture", **payload)
+    marker.write_text("")
+    return payload

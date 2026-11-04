@@ -3,6 +3,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from htprovenance import autocapture
 
 
@@ -210,6 +212,88 @@ def test_capture_and_emit_noop_when_already_captured(monkeypatch, tmp_path):
 
     assert autocapture.capture_and_emit() is None
     assert not (tmp_path / "site_info.json").exists()
+
+
+DAGMAN_AD = {"ClusterId": 7810859, "ProcId": 0, "JobUniverse": 7, "Cmd": "/usr/bin/condor_dagman"}
+SERVICE_AD = {
+    "ClusterId": 7810861,
+    "ProcId": 0,
+    "JobUniverse": 12,
+    "Cmd": "/usr/bin/python3",
+    "DAGManJobId": 7810859,
+}
+
+
+def _capture_as(monkeypatch, tmp_path, ad: dict) -> dict | None:
+    job_ad = tmp_path / f"{ad['ClusterId']}.ad"
+    _write_job_ad(job_ad, ad)
+    monkeypatch.setenv("_CONDOR_JOB_AD", str(job_ad))
+    return autocapture.capture_and_emit()
+
+
+def _events(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+@pytest.fixture
+def access_point(monkeypatch, tmp_path):
+    """A DAG directory on the access point: no PROVENANCE_RUN_ID, no GPUs."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PROVENANCE_RUN_ID", raising=False)
+    monkeypatch.setenv("PROVENANCE_LOG_DIR", str(tmp_path / "output" / "provenance"))
+    monkeypatch.setattr(autocapture, "_run", lambda cmd: "ap2002.chtc.wisc.edu")
+    monkeypatch.setattr(autocapture, "default_gpu_info", lambda: pytest.fail("GPU probe on AP"))
+    return tmp_path
+
+
+def test_dagman_and_service_captures_go_to_dagman_file(monkeypatch, access_point):
+    """DAGMan's PRE/POST children and its SERVICE nodes inherit $_CONDOR_JOB_AD;
+    they are recorded per DAGMan, never as a training job's job.assigned."""
+    _capture_as(monkeypatch, access_point, DAGMAN_AD)
+    _capture_as(monkeypatch, access_point, SERVICE_AD)
+
+    provenance = access_point / "output" / "provenance"
+    assert sorted(p.name for p in provenance.iterdir()) == ["dagman-7810859.ndjson"]
+    events = _events(provenance / "dagman-7810859.ndjson")
+    assert [e["type"] for e in events] == ["dagman.started", "service.started"]
+    assert [e["cluster_id"] for e in events] == [7810859, 7810861]
+    assert all(e["dagman_cluster_id"] == 7810859 for e in events)
+    assert all(e["run_id"] == "dagman-7810859" for e in events)
+    assert all(e["source"] == "submit_host_autocapture" for e in events)
+    assert events[0]["hostname"] == "ap2002.chtc.wisc.edu"
+    assert not (access_point / "site_info.json").exists()
+
+
+def test_submit_host_capture_is_idempotent_per_job(monkeypatch, access_point):
+    _capture_as(monkeypatch, access_point, DAGMAN_AD)
+    assert _capture_as(monkeypatch, access_point, DAGMAN_AD) is None
+
+    events = _events(access_point / "output" / "provenance" / "dagman-7810859.ndjson")
+    assert len(events) == 1
+
+
+def test_local_universe_job_outside_dagman_gets_own_file(monkeypatch, access_point):
+    ad = {key: value for key, value in SERVICE_AD.items() if key != "DAGManJobId"}
+    payload = _capture_as(monkeypatch, access_point, ad)
+
+    assert payload is not None
+    assert payload["dagman_cluster_id"] is None
+    events = _events(access_point / "output" / "provenance" / "local-7810861.ndjson")
+    assert events[0]["type"] == "service.started"
+
+
+@pytest.mark.parametrize(
+    ("ad", "expected"),
+    [
+        (DAGMAN_AD, ("dagman.started", "dagman-7810859", 7810859)),
+        ({**SERVICE_AD, "DAGManJobId": "7810859.0"}, ("service.started", "dagman-7810859", 7810859)),
+        ({"ClusterId": 1, "JobUniverse": 5}, None),
+        ({"ClusterId": 1}, None),
+        ({}, None),
+    ],
+)
+def test_submit_host_capture_target(ad, expected):
+    assert autocapture.submit_host_capture_target(ad) == expected
 
 
 def test_capture_and_emit_writes_site_info_and_emits_event(monkeypatch, tmp_path):
