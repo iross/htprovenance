@@ -4,6 +4,7 @@ title: 'Selectable transport for in-job capture: NDJSON file and/or Chirp'
 status: To Do
 assignee: []
 created_date: '2026-11-04 22:33'
+updated_date: '2026-11-04 22:55'
 labels: []
 dependencies:
   - TASK-1
@@ -56,3 +57,23 @@ Out of scope: TASK-2's file hashes. Choose their transport once this exists (ulo
 - [ ] #7 Verified on ap2001 with a real job in each mode, including one in a container
 - [ ] #8 README documents the toggle, the default, and what each transport needs
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Probe 2026-11-04, ap2001 jobs 12419073 (host) and 12419074 (container universe, docker://python:3.12-slim; CHTC ran it under Docker: .docker_sock in sandbox). Script: scratchpad chirp-probe/probe.sh.
+
+Node config (condor_config_val on host): ENABLE_CHIRP, ENABLE_CHIRP_DELAYED, ENABLE_CHIRP_UPDATES, ENABLE_CHIRP_IO all true; CHIRP_DELAYED_UPDATE_PREFIX = Chirp* My* Progress; CHIRP_DELAYED_UPDATE_MAX_ATTRS = 100.
+
+Q4 (how clients find the starter): env _CONDOR_CHIRP_CONFIG points at <slot dir>/user/.chirp.config (outside the scratch dir); env _CHIRP_DELAYED_UPDATE_PREFIX is also set. Pure-Python htchirp (pip install htchirp) works on the host with no WantIOProxy: set_job_attr_delayed and ulog both succeeded and ChirpProvPy landed in the job ad.
+
+Q2 (prefix): set_job_attr_delayed ProvNoPrefixDelayed -> rc=1, not in ad. Names must match Chirp*, My* or Progress.
+
+Q3 (limits): delayed string value of 100 chars accepted and in ad; 1000 and 4000 fail ('couldn't get response from server'), 10000 rc=255, 50000 segfaults condor_chirp. Exact limit is between 100 and 1000 bytes; not narrowed yet. 60 delayed attributes all accepted (config max 100). ulog: 100/1000/4000-char messages all appear as 008 events; 10000 fails rc=255.
+
+Q1 (containers): Docker-run container: no condor_chirp binary; _CONDOR_CHIRP_CONFIG is set but htchirp gets ConnectionRefused (chirp server on the host isn't reachable from the container's network namespace). Apptainer (shares host network) not tested yet.
+
+Design consequences: one ChirpProv* attribute per field (a JSON blob won't fit); values over the limit must be truncated or skipped and noted; use htchirp in Python (no dependency on /usr/libexec/condor/condor_chirp) or speak the protocol directly; Docker jobs need the file fallback, which the design already has.
+
+Related prior work: mldag task-42 (Push execute-node provenance back via Chirp instead of relying on output-file transfer) planned a chirp put() of the payload to <run_id>.execute_node.ndjson on the AP. That is the Chirp file-I/O path (needs the I/O proxy / ENABLE_CHIRP_IO), distinct from delayed attributes; worth testing put_file without WantIOProxy as another option.
+<!-- SECTION:NOTES:END -->
