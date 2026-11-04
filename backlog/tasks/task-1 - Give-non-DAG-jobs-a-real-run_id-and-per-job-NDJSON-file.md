@@ -4,7 +4,7 @@ title: Default run_id for non-DAG jobs and record the schedd
 status: In Progress
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-04 22:11'
+updated_date: '2026-11-04 22:21'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -43,20 +43,35 @@ ClusterIds are unique only per schedd, so a database holding jobs from more than
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Without PROVENANCE_RUN_ID, an execute-node job's run_id is JobBatchName when set, else cluster-<ClusterId>
-- [ ] #2 PROVENANCE_RUN_ID takes precedence when set (DAG path unchanged)
-- [ ] #3 Access-point captures still use dagman-<cluster> and local-<cluster>
-- [ ] #4 post.py and log_monitor keep their unresolved-DAG-run sentinels that repair.py depends on
-- [ ] #5 NDJSON files are named <run_id>.<cluster>.<proc>.ndjson with a filename-safe run_id and no schedd; two procs never share a file
-- [ ] #6 db build ingests the new files with the original (unsanitized) run_id
-- [ ] #7 job.assigned includes schedd from GlobalJobId
-- [ ] #8 condor_history is keyed by (schedd, cluster_id, proc_id) with schedd NOT NULL; same cluster/proc from two schedds gives two rows
-- [ ] #9 enrich-jobad and enrich-history fill schedd; enrich-history only queries the given schedd for its own clusters
-- [ ] #10 scan derives schedd from the submit event alias or --schedd; scan --db errors clearly when it has neither
-- [ ] #11 An existing provenance.db with the old condor_history key is detected and the table recreated
-- [ ] #12 Tests cover: env var set, JobBatchName only, neither, JobBatchName with unsafe characters, unreadable job ad, multiple procs, two schedds with the same cluster_id, scan with and without a derivable schedd
-- [ ] #13 README documents run_id resolution order and the NDJSON naming scheme
-- [ ] #14 README's statements that jobs are keyed by (cluster_id, proc_id) are updated to include schedd, and scan's --schedd option is documented
-- [ ] #15 Docstrings that describe the old behavior are updated: autocapture module and capture_and_emit, events.event_log_path, db.py's condor_history schema comment, event_log_scan module
+- [x] #1 Without PROVENANCE_RUN_ID, an execute-node job's run_id is JobBatchName when set, else cluster-<ClusterId>
+- [x] #2 PROVENANCE_RUN_ID takes precedence when set (DAG path unchanged)
+- [x] #3 Access-point captures still use dagman-<cluster> and local-<cluster>
+- [x] #4 post.py and log_monitor keep their unresolved-DAG-run sentinels that repair.py depends on
+- [x] #5 NDJSON files are named <run_id>.<cluster>.<proc>.ndjson with a filename-safe run_id and no schedd; two procs never share a file
+- [x] #6 db build ingests the new files with the original (unsanitized) run_id
+- [x] #7 job.assigned includes schedd from GlobalJobId
+- [x] #8 condor_history is keyed by (schedd, cluster_id, proc_id) with schedd NOT NULL; same cluster/proc from two schedds gives two rows
+- [x] #9 enrich-jobad and enrich-history fill schedd; enrich-history only queries the given schedd for its own clusters
+- [x] #10 scan derives schedd from the submit event alias or --schedd; scan --db errors clearly when it has neither
+- [x] #11 An existing provenance.db with the old condor_history key is detected and the table recreated
+- [x] #12 Tests cover: env var set, JobBatchName only, neither, JobBatchName with unsafe characters, unreadable job ad, multiple procs, two schedds with the same cluster_id, scan with and without a derivable schedd
+- [x] #13 README documents run_id resolution order and the NDJSON naming scheme
+- [x] #14 README's statements that jobs are keyed by (cluster_id, proc_id) are updated to include schedd, and scan's --schedd option is documented
+- [x] #15 Docstrings that describe the old behavior are updated: autocapture module and capture_and_emit, events.event_log_path, db.py's condor_history schema comment, event_log_scan module
 - [ ] #16 Verified on ap2001 whether output/provenance/ comes back without explicit transfer_output_files; README documents the answer
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented in 4243cf9 (run_id fallback, per-proc NDJSON, schedd in job.assigned) and ad8a484 (condor_history keyed by schedd).
+
+Scope change vs. original plan: post.py and log_monitor keep their 'unknown' / unknown:<cluster_id> run_ids. They only run inside DAGs, and those values mark unresolved DAG runs that log_monitor retries and repair.py rewrites.
+
+Added beyond the ACs: enrich-jobad --schedd, so job.assigned events captured before schedd was recorded can still be mirrored (otherwise the existing cluster_id backfill for old mldag data would silently stop working).
+
+Unverified on a real access point (tests use fakes):
+- _get_schedd now locates the local schedd via Collector.locate(DaemonTypes.Schedd) with no name, to read its Name. Confirm on ap2001/ap2002 that this returns the local schedd.
+- scan's schedd comes from alias= in the 000 event's 'Job submitted from host: <...>' address. Confirm against a real log (e.g. the ap2002 precmd test.log) that alias is present and equals the schedd Name in GlobalJobId.
+- AC #16 (does output/provenance/ come back without transfer_output_files) is still open.
+<!-- SECTION:NOTES:END -->
