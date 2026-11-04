@@ -49,6 +49,90 @@ database keyed by `(cluster_id, proc_id)`:
 | `htprovenance-query` | Build/query the provenance database; lineage lookups |
 | `htprovenance-repair` | Repair/backfill existing provenance data |
 
+## Configuring which ClassAd fields land in provenance
+
+`htprovenance-post` captures a curated subset of each job's HTCondor ClassAd (from
+`job_ad_file`) into the `job.completed`/`job.failed` provenance events. The
+default mapping (used when no file is configured, or the configured file
+doesn't exist) is:
+
+| ClassAd attribute | Provenance field |
+|---|---|
+| `RemoteWallClockTime` | `wall_time_s` |
+| `CPUsUsage` | `cpu_usage` |
+| `MemoryUsage` | `peak_memory_mb` |
+| `GPUsUsage` | `gpu_usage` |
+| `GLIDEIN_ResourceName` | `resource_name` |
+| `Arguments` | `arguments` |
+
+To capture different or additional fields, add a `classad_fields_file` entry
+to `Experiment.yaml` pointing at a YAML file (conventionally
+`provenance_fields.yaml`) listing the attributes to extract:
+
+```yaml
+fields:
+  RequestCpus: num_cpus_requested   # explicit rename
+  Cmd                                # bare entry -> auto snake_case ("cmd")
+```
+
+The path is baked into the generated DAG at DAG-generation time (`mldag-gen`) (like
+`--log-dir`), so it can't drift between runs — but you can edit the file's
+*contents* at any time without regenerating the DAG. Some ClassAd attributes
+(currently just `Environment`, which can carry secrets like a W&B API key)
+are blocked outright; requesting one raises an error when the file is loaded.
+
+## Inspecting jobs without the full provenance pipeline
+
+Two commands work on jobs that were never instrumented with the PRE/POST
+provenance scripts (a one-off batch, a hand-submitted `.dag`) — no run_id or
+NDJSON events required. Both enrich opportunistically when related data is
+available and silently fall back to bare cluster_id/no-op when it isn't:
+
+```bash
+# Duration, execute host/site, and resource usage straight from an event log
+htprovenance-query scan metl.log
+
+# Filter to specific clusters (repeatable; every proc of a matched cluster is kept)
+htprovenance-query scan metl.log --cluster-id 12345 --cluster-id 12399
+
+# Dump results into provenance.db's condor_history table (source='event_log')
+# instead of/alongside printing them
+htprovenance-query scan metl.log --db provenance.db
+
+# Backfill provenance.db's condor_history table from HTCondor job history
+# (final host, exit code, hold reasons, requested vs. used resources)
+htprovenance-query db enrich-history --schedd <name>
+
+# Mirror job.assigned events (jobad.py's in-job $_CONDOR_JOB_AD capture,
+# emitted immediately at job start) into condor_history too
+htprovenance-query db enrich-jobad
+```
+
+`scan` parses any HTCondor event log directly; if `--log-dir`/
+`--provenance-log-dir` happen to point at a DAGMan provenance run's classad or
+NDJSON directories, matching jobs are enriched with `run_id`/`job_name` too.
+Jobs are keyed by `(cluster_id, proc_id)`, not `cluster_id` alone, since a
+`queue N` job array puts many procs under one cluster.
+
+`condor_history` holds rows from any of three sources — `db enrich-history`
+(queried from HTCondor), `scan --db` (parsed from a raw event log), or
+`db enrich-jobad` (mirrored from `job.assigned` events already in the `events`
+table) — distinguished by its `source` column, since they can disagree and
+none is definitively more current than the others. Writing from more than one
+for the same `(cluster_id, proc_id)` never produces duplicate rows or a
+clobber: a write merges column-by-column into any existing row (a column the
+new write doesn't know about keeps its previous value), and `source` becomes
+e.g. `condor_history,jobad` once both have contributed. `enrich-jobad`
+deliberately never writes `remote_wall_clock_s`/`cpus_usage`/`memory_usage_mb`/
+`gpus_usage`: the job ad is captured at submission, before the job has run,
+so those fields would be near-zero placeholders rather than real usage — use
+`enrich-history` or `scan` for those.
+
+`db enrich-history` queries `condor_history` via the HTCondor Python bindings
+(not the CLI) for every cluster_id already in `provenance.db`'s `events`
+table, and is safe to re-run — already-enriched cluster_ids are skipped
+unless `--full-rescan` is passed. Requires `htcondor2` (Linux only).
+
 ## Relationship to mldag
 
 `mldag` depends on `htprovenance`, not the other way around. It bakes
