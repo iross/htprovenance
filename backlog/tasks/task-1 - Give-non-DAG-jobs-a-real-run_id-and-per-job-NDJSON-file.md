@@ -4,7 +4,7 @@ title: Default run_id for non-DAG jobs and record the schedd
 status: In Progress
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-04 22:25'
+updated_date: '2026-11-04 22:35'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -79,4 +79,7 @@ Verified 2026-11-04:
 - ap2002: Collector().locate(DaemonTypes.Schedd)['Name'] returns ap2002.chtc.wisc.edu; the submit event's alias=ap2002.chtc.wisc.edu matches GlobalJobId's schedd part (with an IPv6 addrs= entry in the address, which the regex handles).
 - ap2001 jobs 12419027 / 12419028: with no transfer_output_files, only top-level top.txt came back (4 bytes sent); output/provenance/test.ndjson did not. With transfer_output_files = output, top.txt, both came back (22 bytes). Documented in README.
 Open question raised with the user: non-DAG jobs therefore don't return their NDJSON by default; consider writing to the sandbox top level when not in a DAG. Related: site_info.json and the .htprovenance_autocapture_done marker are top-level files, so they already come back by default and site_info.json overwrites across procs in a shared Iwd.
+
+Follow-up (user decision, 2026-11-04): non-DAG jobs (no PROVENANCE_RUN_ID, no PROVENANCE_LOG_DIR) now write their NDJSON at the sandbox top level so default output transfer returns it. mldag DAGs and explicit PROVENANCE_LOG_DIR unchanged; access-point captures keep output/provenance.
+Not changed: site_info.json (top-level, read by watcher.py's _load_site_info and possibly mldag scripts) still comes back by default and is overwritten per proc in a shared directory; the .htprovenance_autocapture_done marker also comes back. Left for the user to decide since site_info.json is a cross-repo contract.
 <!-- SECTION:NOTES:END -->

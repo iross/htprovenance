@@ -17,9 +17,10 @@ run_id for an execute-node job is $PROVENANCE_RUN_ID when set (mldag's
 generated DAGs set it; their file naming is unchanged). Otherwise -- a plain
 condor_submit, or a hand-written DAG -- it is the job's JobBatchName, else
 cluster-<ClusterId>, and the job writes its own
-<run_id>.<cluster>.<proc>.ndjson so procs returning to a shared directory
+<run_id>.<cluster>.<proc>.ndjson at the top level of its sandbox, so default
+output transfer brings it back and procs returning to a shared directory
 never overwrite each other's file. See execute_node_run_id /
-execute_node_ndjson_stem.
+execute_node_log_dir / execute_node_ndjson_stem.
 
 Processes on the access point see $_CONDOR_JOB_AD too: DAGMan's PRE/POST
 scripts inherit DAGMan's own (scheduler-universe) ad, and SERVICE nodes run
@@ -139,6 +140,23 @@ def execute_node_run_id(ad: dict) -> str:
     if cluster_id is not None:
         return f"cluster-{cluster_id}"
     return "unknown"
+
+
+def execute_node_log_dir() -> Path:
+    """Return the directory an execute-node job writes its NDJSON into.
+
+    $PROVENANCE_LOG_DIR if set. Otherwise output/provenance for jobs with
+    $PROVENANCE_RUN_ID (mldag's DAGs, unchanged), and the top level of the
+    sandbox for any other job: HTCondor's default output transfer returns new
+    top-level files but not new subdirectories, so a plain condor_submit job
+    gets its provenance back without listing it in transfer_output_files.
+    """
+    log_dir = os.environ.get("PROVENANCE_LOG_DIR")
+    if log_dir:
+        return Path(log_dir)
+    if os.environ.get("PROVENANCE_RUN_ID"):
+        return Path(_DEFAULT_LOG_DIR)
+    return Path()
 
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
@@ -280,11 +298,11 @@ def capture_and_emit(
         if not detect_condor_job():
             return None
         ad = parse_classad(os.environ["_CONDOR_JOB_AD"])
-        log_dir = Path(os.environ.get("PROVENANCE_LOG_DIR", _DEFAULT_LOG_DIR))
         target = submit_host_capture_target(ad)
         if target is not None:
+            log_dir = Path(os.environ.get("PROVENANCE_LOG_DIR", _DEFAULT_LOG_DIR))
             return _capture_submit_host(ad, target, log_dir, fields_file)
-        return _capture_execute_node(ad, log_dir, gpu_info, fields_file)
+        return _capture_execute_node(ad, execute_node_log_dir(), gpu_info, fields_file)
     except Exception:  # noqa: BLE001 -- deliberately blind: AC#7's whole point
         # is that any failure here (best-effort) must never affect the
         # training job's own behavior, output, or exit code.

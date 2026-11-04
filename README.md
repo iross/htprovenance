@@ -62,17 +62,23 @@ inside each event keeps the original text, and `db build` reads it from there.
 The event also records `schedd` (taken from `GlobalJobId`), since a
 `ClusterId` is only unique per access point.
 
-These files are written inside the job's sandbox, under `output/provenance/`
-(or `$PROVENANCE_LOG_DIR`). HTCondor's default output transfer only returns new
-files at the top level of the sandbox, not new subdirectories, so a plain job
-must name the directory for its provenance to come back:
+For cases 2 and 3 the file is written at the top level of the job's sandbox
+(unless `$PROVENANCE_LOG_DIR` says otherwise), because HTCondor's default
+output transfer returns new top-level files but not new subdirectories.
+Tested on CHTC's ap2001, 2026-11-04: without `transfer_output_files`, a
+top-level file came back and `output/provenance/` did not. So:
 
-```
-transfer_output_files = output, <your other outputs>
-```
+- With default output transfer, the `.ndjson` files land in the job's
+  submit directory (its `initialdir`) next to its other outputs. Load them with
+  `htprovenance-query db build --event-dir <that directory>`.
+- If the job lists `transfer_output_files`, add the file to it, e.g.
+  `transfer_output_files = results.csv, $(batch_name).$(ClusterId).$(ProcId).ndjson`
+  when `batch_name` is set (and contains only letters, digits, `.`, `_` and
+  `-`, so the file name isn't altered), or
+  `cluster-$(ClusterId).$(ClusterId).$(ProcId).ndjson` when it isn't.
 
-(Tested on CHTC's ap2001, 2026-11-04: without `transfer_output_files`, only the
-top-level file came back; with `output` listed, `output/provenance/` did.)
+mldag's DAGs (which set `PROVENANCE_RUN_ID`) keep writing to
+`output/provenance/`.
 
 ## CLI
 

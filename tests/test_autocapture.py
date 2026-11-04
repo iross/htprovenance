@@ -525,6 +525,43 @@ def test_db_build_reads_run_id_from_event_not_file_name(monkeypatch, execute_nod
     assert rows == [(batch_name, "job.assigned")]
 
 
+@pytest.mark.parametrize(
+    ("run_id_env", "log_dir_env", "expected"),
+    [
+        (None, None, "."),
+        ("run-abc123", None, "output/provenance"),
+        (None, "custom/dir", "custom/dir"),
+        ("run-abc123", "custom/dir", "custom/dir"),
+    ],
+)
+def test_execute_node_log_dir(monkeypatch, run_id_env, log_dir_env, expected):
+    for name, value in (("PROVENANCE_RUN_ID", run_id_env), ("PROVENANCE_LOG_DIR", log_dir_env)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    assert autocapture.execute_node_log_dir() == Path(expected)
+
+
+def test_plain_job_writes_ndjson_at_sandbox_top_level(monkeypatch, execute_node):
+    monkeypatch.delenv("PROVENANCE_LOG_DIR")
+
+    _capture_as(monkeypatch, execute_node, PLAIN_JOB_AD)
+
+    [event] = _events(execute_node / "cluster-555.555.0.ndjson")
+    assert event["run_id"] == "cluster-555"
+    assert not (execute_node / "output").exists()
+
+
+def test_access_point_capture_keeps_output_provenance_default(monkeypatch, access_point):
+    monkeypatch.delenv("PROVENANCE_LOG_DIR")
+
+    _capture_as(monkeypatch, access_point, DAGMAN_AD)
+
+    assert (access_point / "output" / "provenance" / "dagman-7810859.ndjson").exists()
+
+
 # --- main() CLI ---
 
 
