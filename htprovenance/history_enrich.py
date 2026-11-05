@@ -98,7 +98,13 @@ _FIELD_MAPPING = {
 
 # Environment is projected (to recover run_id) but is never stored -- see
 # module docstring -- so it's kept out of _FIELD_MAPPING's column mapping.
-_PROJECTION = list(dict.fromkeys(["ClusterId", "Environment", "GlobalJobId", *_FIELD_MAPPING]))
+# ResidentSetSize is projected only so MemoryUsage, an expression over it in
+# history ads, can be evaluated (see _plain_ad).
+_PROJECTION = list(
+    dict.fromkeys(
+        ["ClusterId", "Environment", "GlobalJobId", "ResidentSetSize", *_FIELD_MAPPING]
+    )
+)
 
 # job_name/site/gpu_ids are event-log-only fields (event_log_scan.py); status
 # is populated by both sources but from different vocabularies (see
@@ -218,6 +224,29 @@ def _known_cluster_ids(conn: sqlite3.Connection, schedd_name: str) -> set[int]:
         for schedd, cluster_id in [*from_events, *from_condor_history]
         if schedd is None or schedd == schedd_name
     }
+
+
+_PLAIN_TYPES = (bool, int, float, str)
+
+
+def _plain_ad(ad) -> dict:
+    """Return a history ClassAd as a dict of values SQLite can store.
+
+    Some attributes are expressions (ExprTree) rather than literals, e.g.
+    MemoryUsage = ((ResidentSetSize + 1023) / 1024). Each is evaluated
+    within the ad; one that doesn't evaluate to a plain value (it references
+    an attribute outside the projection, or is a list or nested ad) keeps
+    its expression text instead.
+    """
+    plain = {}
+    for key, value in ad.items():
+        if value is None or type(value) in _PLAIN_TYPES:
+            plain[key] = value
+            continue
+        # Exact type, not isinstance: classad2.Value.Undefined/Error are IntEnums.
+        evaluated = ad.eval(key)
+        plain[key] = evaluated if type(evaluated) in _PLAIN_TYPES else str(value)
+    return plain
 
 
 def _row_from_ad(ad: dict, queried_schedd: str) -> dict:
@@ -585,7 +614,7 @@ def enrich_from_condor_history(
 
             found: set[int] = set()
             for ad in ads:
-                ad_dict = dict(ad)
+                ad_dict = _plain_ad(ad)
                 cluster_id = ad_dict.get("ClusterId")
                 if cluster_id is None:
                     continue

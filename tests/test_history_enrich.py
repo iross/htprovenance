@@ -108,7 +108,51 @@ def _ad(cluster_id: int, run_id: str = "run-abc", proc_id: int = 0, **overrides)
     return ad
 
 
+def _classad(cluster_id: int, **expressions: str):
+    """A real ClassAd like Schedd.history() returns, with some attributes as expressions."""
+    import classad2  # ty: ignore[import-not-found] -- Linux-only, like htcondor2
+
+    ad = classad2.ClassAd()
+    for key, value in _ad(cluster_id).items():
+        ad[key] = value
+    for key, text in expressions.items():
+        ad[key] = classad2.ExprTree(text)
+    return ad
+
+
 # --- basic enrichment ---
+
+
+def test_enrich_evaluates_expression_attributes(tmp_path, monkeypatch):
+    """MemoryUsage is an expression in history ads; storing the ExprTree itself
+    made sqlite3 raise 'type ExprTree is not supported'."""
+    db_path = _seed_db(tmp_path, [100])
+    ad = _classad(
+        100,
+        MemoryUsage="((ResidentSetSize + 1023) / 1024)",
+        RequestMemory="ifThenElse(MemoryUsage =!= undefined, MemoryUsage, 1024)",
+        RequestGPUs="(TARGET.GPUs * 2)",
+    )
+    ad["ResidentSetSize"] = 2048000
+    schedd = _FakeSchedd({100: ad})
+    monkeypatch.setattr(
+        "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
+    )
+
+    stats = enrich_from_condor_history(db_path)
+
+    assert stats.enriched == 1
+    [(memory_usage, request_memory, request_gpus)] = _query(
+        db_path, "SELECT memory_usage_mb, request_memory, request_gpus FROM condor_history"
+    )
+    assert (memory_usage, request_memory) == (2000, 2000)
+    assert "GPUs" in request_gpus
+
+
+def test_enrich_projects_resident_set_size():
+    from htprovenance.history_enrich import _PROJECTION
+
+    assert "ResidentSetSize" in _PROJECTION
 
 
 def test_enrich_inserts_rows_for_new_cluster_ids(tmp_path, monkeypatch):
