@@ -319,7 +319,7 @@ def test_capture_and_emit_emits_event_without_site_info_file(monkeypatch, tmp_pa
 
     assert not (tmp_path / "site_info.json").exists()
 
-    ndjson_path = tmp_path / "output" / "provenance" / "run-abc123.ndjson"
+    ndjson_path = tmp_path / "output" / "provenance" / "run-abc123.555.0.ndjson"
     events = [json.loads(line) for line in ndjson_path.read_text().splitlines()]
     assert len(events) == 1
     assert events[0]["type"] == "job.assigned"
@@ -350,7 +350,7 @@ def test_capture_and_emit_is_idempotent(monkeypatch, tmp_path):
     second = autocapture.capture_and_emit()
 
     assert second is None
-    ndjson_path = tmp_path / "output" / "provenance" / "run-abc123.ndjson"
+    ndjson_path = tmp_path / "output" / "provenance" / "run-abc123.555.0.ndjson"
     assert len(ndjson_path.read_text().splitlines()) == 1
 
 
@@ -452,13 +452,29 @@ def test_run_id_is_batch_name_when_set(monkeypatch, execute_node):
     assert event["run_id"] == "sweep-a"
 
 
-def test_env_var_wins_over_batch_name_and_keeps_per_run_file(monkeypatch, execute_node):
+def test_env_var_wins_over_batch_name(monkeypatch, execute_node):
     monkeypatch.setenv("PROVENANCE_RUN_ID", "run-abc123")
     _capture_as(monkeypatch, execute_node, {**PLAIN_JOB_AD, "JobBatchName": "sweep-a"})
 
-    assert _ndjson_files(execute_node) == ["run-abc123.ndjson"]
-    [event] = _events(execute_node / "output" / "provenance" / "run-abc123.ndjson")
+    [event] = _events(execute_node / "output" / "provenance" / "run-abc123.555.0.ndjson")
     assert event["run_id"] == "run-abc123"
+
+
+def test_dag_jobs_of_one_run_write_distinct_files(monkeypatch, execute_node):
+    """mldag's jobs share a PROVENANCE_RUN_ID and all return output/provenance
+    to one directory; a shared <run_id>.ndjson would be replaced by each
+    returning job's copy."""
+    monkeypatch.setenv("PROVENANCE_RUN_ID", "run-abc123")
+    for cluster_id in (555, 556):
+        sandbox = execute_node / f"sandbox{cluster_id}"
+        sandbox.mkdir()
+        monkeypatch.chdir(sandbox)
+        _capture_as(monkeypatch, sandbox, {**PLAIN_JOB_AD, "ClusterId": cluster_id})
+
+    assert _ndjson_files(execute_node) == [
+        "run-abc123.555.0.ndjson",
+        "run-abc123.556.0.ndjson",
+    ]
 
 
 def test_unsafe_batch_name_is_sanitized_in_file_name_only(monkeypatch, execute_node):

@@ -119,6 +119,36 @@ def test_query_run_skips_malformed_lines(tmp_path):
     assert len(result) == 2
 
 
+def _event(event_type: str, run_id: str, ts: str) -> dict:
+    return {"schema_version": "1.0", "type": event_type, "run_id": run_id, "ts": ts}
+
+
+def test_query_run_merges_run_file_and_per_job_files(tmp_path):
+    _write_events(tmp_path, "r1", [_event("job.submitted", "r1", "2026-01-01T00:00:00")])
+    _write_events(tmp_path, "r1.555.0", [_event("job.assigned", "r1", "2026-01-01T00:01:00")])
+    _write_events(tmp_path, "r1.556.0", [_event("epoch.completed", "r1", "2026-01-01T00:02:00")])
+
+    result = query_run("r1", tmp_path)
+
+    assert [e["type"] for e in result] == ["job.submitted", "job.assigned", "epoch.completed"]
+
+
+def test_query_run_reads_per_job_files_without_run_file(tmp_path):
+    _write_events(tmp_path, "cluster-555.555.0", [_event("job.assigned", "cluster-555", "t")])
+
+    assert [e["type"] for e in query_run("cluster-555", tmp_path)] == ["job.assigned"]
+
+
+def test_query_run_matches_sanitized_file_names_by_event_run_id(tmp_path):
+    """'my sweep' is filed as my_sweep.*; 'my_sweep' and 'my.sweep' runs must not leak in."""
+    _write_events(tmp_path, "my_sweep.555.0", [_event("job.assigned", "my sweep", "t1")])
+    _write_events(tmp_path, "my_sweep.556.0", [_event("job.assigned", "my_sweep", "t2")])
+    _write_events(tmp_path, "my.sweep.557.0", [_event("job.assigned", "my.sweep", "t3")])
+
+    assert [e["ts"] for e in query_run("my sweep", tmp_path)] == ["t1"]
+    assert [e["ts"] for e in query_run("my", tmp_path)] == []
+
+
 # --- CLI: lineage ---
 
 

@@ -6,9 +6,9 @@ smaller than PIPE_BUF (~4 KB) are atomic, so concurrent epoch writers are
 safe without additional locking.
 
 Event log location: <log_dir>/<run_id>.ndjson, or <log_dir>/<ndjson_stem>.ndjson
-                    when the caller passes one (execute-node capture for jobs
-                    without PROVENANCE_RUN_ID writes one file per cluster.proc;
-                    see htprovenance.autocapture)
+                    when the caller passes one (events written inside an
+                    execute-node job go to one file per cluster.proc; see
+                    htprovenance.autocapture.execute_node_ndjson_stem)
 Default log_dir:    output/provenance
 """
 

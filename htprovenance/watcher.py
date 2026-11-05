@@ -26,7 +26,7 @@ import sys
 import time
 from pathlib import Path
 
-from htprovenance.autocapture import execute_node_event_log_path
+from htprovenance.autocapture import execute_node_event_log_path, execute_node_ndjson_stem
 from htprovenance.events import _DEFAULT_LOG_DIR, emit_event
 from htprovenance.post import parse_classad
 from htprovenance.sidecar import write_sidecar
@@ -133,6 +133,19 @@ def _read_metrics_csv(watch_dir: Path) -> dict[int, dict]:
     return result
 
 
+def _job_ndjson_stem(run_id: str) -> str | None:
+    """Return this job's own NDJSON file stem, or None outside an HTCondor job.
+
+    Same file autocapture writes job.assigned to, so a job's in-sandbox
+    events never share a name with another job's (see
+    htprovenance.autocapture.execute_node_ndjson_stem).
+    """
+    job_ad_path = os.environ.get("_CONDOR_JOB_AD")
+    if not job_ad_path:
+        return None
+    return execute_node_ndjson_stem(run_id, parse_classad(job_ad_path))
+
+
 def scan_once(
     watch_dir: str | Path,
     run_id: str,
@@ -141,6 +154,7 @@ def scan_once(
     log_dir: str | Path = _DEFAULT_LOG_DIR,
     start_time: float | None = None,
     extra_sidecar: dict | None = None,
+    ndjson_stem: str | None = None,
 ) -> None:
     """Single-pass scan: emit epoch events and write sidecars for all checkpoints.
 
@@ -152,6 +166,8 @@ def scan_once(
         start_time: Unix timestamp of training start, used to compute
             duration_s for the first epoch. If None, duration_s is omitted
             for the first checkpoint.
+        extra_sidecar: Merged into each sidecar's 'extra' field.
+        ndjson_stem: NDJSON file name (without .ndjson); defaults to run_id.
     """
     watch_dir = Path(watch_dir)
     log_dir = Path(log_dir)
@@ -194,7 +210,7 @@ def scan_once(
             training_data["val_loss"] = val_loss
 
         emit_event(
-            "epoch.started", run_id, log_dir=log_dir,
+            "epoch.started", run_id, log_dir=log_dir, ndjson_stem=ndjson_stem,
             epoch=epoch, checkpoint_in_hash=parent_hash,
             source="checkpoint_file_watcher",
         )
@@ -211,7 +227,14 @@ def scan_once(
             completed_fields["val_loss"] = val_loss
             completed_fields["val_loss_source"] = val_loss_source
 
-        emit_event("epoch.completed", run_id, log_dir=log_dir, epoch=epoch, **completed_fields)
+        emit_event(
+            "epoch.completed",
+            run_id,
+            log_dir=log_dir,
+            ndjson_stem=ndjson_stem,
+            epoch=epoch,
+            **completed_fields,
+        )
 
         parent_hash = new_hash
         prev_time = ckpt_mtime
@@ -226,6 +249,7 @@ def watch_and_emit(
     idle_timeout: float = 3600.0,
     log_dir: str | Path = _DEFAULT_LOG_DIR,
     extra_sidecar: dict | None = None,
+    ndjson_stem: str | None = None,
 ) -> None:
     """Poll watch_dir until SIGTERM or idle_timeout with no new checkpoints.
 
@@ -236,6 +260,8 @@ def watch_and_emit(
         poll_interval: Seconds between directory scans.
         idle_timeout: Exit after this many seconds with no new checkpoints.
         log_dir: Directory for NDJSON event logs.
+        extra_sidecar: Merged into each sidecar's 'extra' field.
+        ndjson_stem: NDJSON file name (without .ndjson); defaults to run_id.
     """
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -259,6 +285,7 @@ def watch_and_emit(
                 "epoch.started",
                 run_id,
                 log_dir=log_dir,
+                ndjson_stem=ndjson_stem,
                 epoch=epoch_index,
                 checkpoint_in_hash=parent_hash,
                 source="checkpoint_file_watcher",
@@ -289,7 +316,14 @@ def watch_and_emit(
             if val_loss is not None:
                 completed_fields["val_loss"] = val_loss
                 completed_fields["val_loss_source"] = "checkpoint_filename"
-            emit_event("epoch.completed", run_id, log_dir=log_dir, epoch=epoch_index, **completed_fields)
+            emit_event(
+                "epoch.completed",
+                run_id,
+                log_dir=log_dir,
+                ndjson_stem=ndjson_stem,
+                epoch=epoch_index,
+                **completed_fields,
+            )
 
             parent_hash = new_hash
             epoch_index += 1
@@ -329,6 +363,7 @@ def main() -> None:
     args = parser.parse_args()
 
     log_dir = args.log_dir or os.environ.get("PROVENANCE_LOG_DIR", _DEFAULT_LOG_DIR)
+    ndjson_stem = _job_ndjson_stem(args.run_id)
     extra_sidecar: dict = {}
     if args.extra_sidecar_json:
         try:
@@ -344,6 +379,7 @@ def main() -> None:
             log_dir=log_dir,
             start_time=args.start_time,
             extra_sidecar=extra_sidecar,
+            ndjson_stem=ndjson_stem,
         )
     else:
         watch_and_emit(
@@ -354,6 +390,7 @@ def main() -> None:
             idle_timeout=args.idle_timeout,
             log_dir=log_dir,
             extra_sidecar=extra_sidecar,
+            ndjson_stem=ndjson_stem,
         )
 
 

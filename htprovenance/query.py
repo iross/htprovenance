@@ -2,7 +2,7 @@
 
 Library functions:
     walk_lineage(checkpoint_path)  -- follow parent_hash chain back to epoch 0
-    query_run(run_id, log_dir)     -- read all events from the NDJSON log
+    query_run(run_id, log_dir)     -- read a run's events from its NDJSON logs
 
 CLI:
     htprovenance-query lineage <checkpoint>   -- print ancestry chain
@@ -23,6 +23,7 @@ from typing import Annotated, Optional
 
 import typer
 
+from htprovenance.autocapture import filename_safe_run_id
 from htprovenance.db import (
     DEFAULT_CHECKPOINT_DIR,
     DEFAULT_DB_PATH,
@@ -121,28 +122,44 @@ def walk_lineage(checkpoint_path: str | Path) -> list[dict]:
 def query_run(run_id: str, log_dir: str | Path = _DEFAULT_LOG_DIR) -> list[dict]:
     """Return all provenance events for run_id in chronological order.
 
+    Reads the run's access-point file (<run_id>.ndjson) and every per-job
+    file its execute-node jobs wrote (<run_id>.<cluster>.<proc>.ndjson, see
+    htprovenance.autocapture.execute_node_ndjson_stem). A per-job file's name
+    only approximates its run_id (the run_id is made filename-safe), so only
+    its events whose run_id field matches are kept.
+
     Args:
-        run_id: The run identifier (PROVENANCE_RUN_ID).
+        run_id: The run identifier (PROVENANCE_RUN_ID, JobBatchName or
+            cluster-<ClusterId>).
         log_dir: Directory containing NDJSON event logs.
 
     Returns:
         List of event dicts sorted by ts field.
 
     Raises:
-        FileNotFoundError: if the NDJSON log for run_id does not exist.
+        FileNotFoundError: if no NDJSON log for run_id exists in log_dir.
     """
-    log_path = Path(log_dir) / f"{run_id}.ndjson"
-    if not log_path.exists():
-        raise FileNotFoundError(f"No event log found for run {run_id!r} at {log_path}")
+    log_dir = Path(log_dir)
+    run_path = log_dir / f"{run_id}.ndjson"
+    job_paths = sorted(log_dir.glob(f"{filename_safe_run_id(run_id)}.*.ndjson"))
+    if not run_path.exists() and not job_paths:
+        raise FileNotFoundError(f"No event log found for run {run_id!r} in {log_dir}")
+    events = _read_ndjson(run_path) if run_path.exists() else []
+    for job_path in job_paths:
+        events.extend(e for e in _read_ndjson(job_path) if e.get("run_id") == run_id)
+    return sorted(events, key=lambda e: e.get("ts", ""))
+
+
+def _read_ndjson(path: Path) -> list[dict]:
     events = []
-    for line in log_path.read_text().splitlines():
+    for line in path.read_text().splitlines():
         line = line.strip()
         if line:
             try:
                 events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-    return sorted(events, key=lambda e: e.get("ts", ""))
+    return events
 
 
 # ---------------------------------------------------------------------------

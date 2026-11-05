@@ -14,12 +14,13 @@ already relies on to locate the job's ClassAd snapshot (see its module
 docstring) -- one detection signal, not two independently-drifting ones.
 
 run_id for an execute-node job is $PROVENANCE_RUN_ID when set (mldag's
-generated DAGs set it; their file naming is unchanged). Otherwise -- a plain
-condor_submit, or a hand-written DAG -- it is the job's JobBatchName, else
-cluster-<ClusterId>, and the job writes its own
-<run_id>.<cluster>.<proc>.ndjson at the top level of its sandbox, so default
-output transfer brings it back and procs returning to a shared directory
-never overwrite each other's file. See execute_node_run_id /
+generated DAGs set it). Otherwise -- a plain condor_submit, or a hand-written
+DAG -- it is the job's JobBatchName, else cluster-<ClusterId>. Every
+execute-node job writes its own <run_id>.<cluster>.<proc>.ndjson, so jobs
+returning output to a shared directory never overwrite each other's file (nor
+the access point's <run_id>.ndjson). mldag's jobs write it under
+output/provenance; other jobs at the top level of their sandbox, so default
+output transfer brings it back. See execute_node_run_id /
 execute_node_log_dir / execute_node_ndjson_stem.
 
 Processes on the access point see $_CONDOR_JOB_AD too: DAGMan's PRE/POST
@@ -177,22 +178,31 @@ _MAX_STEM_RUN_ID_CHARS = 200
 def execute_node_ndjson_stem(run_id: str, ad: dict) -> str | None:
     """Return the NDJSON file stem for an execute-node job, or None to use run_id.
 
-    Jobs with $PROVENANCE_RUN_ID keep the per-run <run_id>.ndjson file. Any
-    other job gets <run_id>.<cluster>.<proc>: a JobBatchName run_id can span
-    several clusters, and every proc writes its own sandbox copy, so a shared
-    name would be overwritten when outputs return to one directory. run_id
-    can be free text (JobBatchName), so it's made filename-safe here; the
-    event itself keeps the original.
+    <run_id>.<cluster>.<proc>: every job writes its own sandbox copy, and
+    output transfer replaces a same-named file in the directory it returns
+    to, so a per-run name would let each job's file clobber the previous
+    jobs' events and the access point's own <run_id>.ndjson. The cluster is
+    needed because a run_id (a DAG run, a JobBatchName) spans several
+    clusters. run_id can be free text (JobBatchName), so it's made
+    filename-safe here; the event itself keeps the original. None (use
+    run_id) only when the job ad lacks ClusterId/ProcId.
     """
-    if os.environ.get("PROVENANCE_RUN_ID"):
-        return None
     cluster_id = _ad_int(ad, "ClusterId")
     proc_id = _ad_int(ad, "ProcId")
     if cluster_id is None or proc_id is None:
         return None
+    return f"{filename_safe_run_id(run_id)}.{cluster_id}.{proc_id}"
+
+
+def filename_safe_run_id(run_id: str) -> str:
+    """Return run_id as it appears at the start of a per-job NDJSON file name.
+
+    Characters other than letters, digits, '.', '_' and '-' become '_', the
+    result is capped in length, and leading dots are dropped so the file is
+    never hidden. Never contains glob metacharacters.
+    """
     safe_run_id = _UNSAFE_FILENAME_CHARS.sub("_", run_id)[:_MAX_STEM_RUN_ID_CHARS]
-    safe_run_id = safe_run_id.lstrip(".") or "_"
-    return f"{safe_run_id}.{cluster_id}.{proc_id}"
+    return safe_run_id.lstrip(".") or "_"
 
 
 def default_gpu_info() -> tuple[dict, str]:

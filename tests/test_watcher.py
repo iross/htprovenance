@@ -55,13 +55,21 @@ def test_main_log_dir_flag_overrides_env(tmp_path):
 SITE_JOB_AD = {"ClusterId": 555, "ProcId": 0, "JobUniverse": 5}
 
 
-def _write_job_assigned(monkeypatch, sandbox: Path, extra_events: tuple[dict, ...] = ()) -> None:
-    """Run the real autocapture in a fake sandbox, then append any extra event lines."""
+def _write_job_assigned(
+    monkeypatch, sandbox: Path, extra_events: tuple[dict, ...] = (), run_id: str | None = None
+) -> None:
+    """Run the real autocapture in a fake sandbox, then append any extra event lines.
+
+    run_id sets PROVENANCE_RUN_ID, as an mldag DAG job has; None leaves it unset.
+    """
     monkeypatch.chdir(sandbox)
     job_ad = sandbox / ".job.ad"
     job_ad.write_text("".join(f"{k} = {v}\n" for k, v in SITE_JOB_AD.items()))
     monkeypatch.setenv("_CONDOR_JOB_AD", str(job_ad))
-    monkeypatch.delenv("PROVENANCE_RUN_ID", raising=False)
+    if run_id is None:
+        monkeypatch.delenv("PROVENANCE_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("PROVENANCE_RUN_ID", run_id)
     monkeypatch.delenv("PROVENANCE_LOG_DIR", raising=False)
     monkeypatch.setattr(autocapture, "_run", lambda cmd: "gpu04.chtc.wisc.edu")
     monkeypatch.setattr(
@@ -100,6 +108,33 @@ def test_load_site_info_ignores_other_events_and_malformed_lines(monkeypatch, tm
     )
     with open(autocapture.execute_node_event_log_path(SITE_JOB_AD), "a") as f:
         f.write("not json\n")
+
+    site, _ = _load_site_info()
+
+    assert site["hostname"] == "gpu04.chtc.wisc.edu"
+
+
+def test_main_in_dag_job_writes_epochs_to_the_jobs_own_file(monkeypatch, tmp_path):
+    """Epoch events share the job's per-job file with job.assigned, so a DAG
+    job's returned output never replaces the run's other events."""
+    _write_job_assigned(monkeypatch, tmp_path, run_id="run-abc")
+    log_dir = tmp_path / "output" / "provenance"
+    watch_dir = tmp_path / "watch"
+    watch_dir.mkdir()
+    _make_ckpt(watch_dir / "epoch=0-step=1-val_loss=1.0.ckpt")
+
+    argv = ["watcher", str(watch_dir), "run-abc", "--one-shot", "--log-dir", str(log_dir)]
+    with patch("sys.argv", argv):
+        main()
+
+    assert sorted(p.name for p in log_dir.iterdir()) == ["run-abc.555.0.ndjson"]
+    events = _read_events(log_dir, "run-abc.555.0")
+    assert [e["type"] for e in events] == ["job.assigned", "epoch.started", "epoch.completed"]
+    assert {e["run_id"] for e in events} == {"run-abc"}
+
+
+def test_load_site_info_in_dag_job(monkeypatch, tmp_path):
+    _write_job_assigned(monkeypatch, tmp_path, run_id="run-abc")
 
     site, _ = _load_site_info()
 

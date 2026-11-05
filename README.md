@@ -46,18 +46,22 @@ database keyed by `(schedd, cluster_id, proc_id)`:
 The execute-side capture files its `job.assigned` event under a `run_id`,
 resolved from the job's environment and ClassAd:
 
-1. `PROVENANCE_RUN_ID`, if set. mldag's generated DAGs set it; those events go
-   to `<run_id>.ndjson` as before.
+1. `PROVENANCE_RUN_ID`, if set. mldag's generated DAGs set it.
 2. `JobBatchName`, if set. Submits that share a batch name share a `run_id`.
    A hand-written DAG gets DAGMan's default batch name
    (`<dagfile>+<DAGMan cluster>`), so its nodes group per DAG run.
 3. `cluster-<ClusterId>` otherwise: one `condor_submit` is one run.
 
-For cases 2 and 3 each job writes its own `<run_id>.<cluster>.<proc>.ndjson`,
-so the procs of a `queue N` never overwrite each other's file when their
-outputs come back to the same directory. The file name has unsafe characters
-in the batch name replaced with `_` and is capped in length; the `run_id`
-inside each event keeps the original text, and `db build` reads it from there.
+Events written inside a job (`job.assigned` and the checkpoint watcher's
+`epoch.*` events) go to that job's own `<run_id>.<cluster>.<proc>.ndjson`.
+Output transfer replaces a same-named file in the directory it returns to, so
+with one shared `<run_id>.ndjson` each finishing job would overwrite the
+events of the jobs before it, and the access point's own events for the run.
+The access point's DAGMan scripts and log monitor keep appending to
+`<run_id>.ndjson`; `db build` and `htprovenance-query events <run_id>` read
+both. The file name has unsafe characters in the `run_id` replaced with `_`
+and is capped in length; the `run_id` inside each event keeps the original
+text, and `db build` reads it from there.
 
 The event also records `schedd` (taken from `GlobalJobId`), since a
 `ClusterId` is only unique per access point.
@@ -77,8 +81,8 @@ top-level file came back and `output/provenance/` did not. So:
   `-`, so the file name isn't altered), or
   `cluster-$(ClusterId).$(ClusterId).$(ProcId).ndjson` when it isn't.
 
-mldag's DAGs (which set `PROVENANCE_RUN_ID`) keep writing to
-`output/provenance/`.
+mldag's jobs (which set `PROVENANCE_RUN_ID`) write their per-job file under
+`output/provenance/`, which their `transfer_output_files = output` brings back.
 
 ## CLI
 
