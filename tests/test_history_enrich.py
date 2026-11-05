@@ -141,9 +141,17 @@ def test_enrich_on_progress_reports_batches(tmp_path, monkeypatch):
     assert sum("Batch 2/2" in m for m in messages) == 1
 
 
-def test_enrich_on_progress_reports_nothing_to_do(tmp_path, monkeypatch):
+def _db_without_cluster_ids(tmp_path: Path) -> Path:
+    """A built db whose only event (a PRE-script job.submitted) carries no cluster_id."""
+    prov_dir = tmp_path / "provenance"
+    _write_event(prov_dir, "r1.ndjson", [{"type": "job.submitted", "run_id": "r1", "ts": "t"}])
     db_path = tmp_path / "provenance.db"
-    build_database(db_path, [], [])
+    build_database(db_path, [], [prov_dir])
+    return db_path
+
+
+def test_enrich_on_progress_reports_nothing_to_do(tmp_path, monkeypatch):
+    db_path = _db_without_cluster_ids(tmp_path)
     schedd = _FakeSchedd({})
     monkeypatch.setattr(
         "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)
@@ -170,8 +178,7 @@ def test_enrich_without_on_progress_does_not_error(tmp_path, monkeypatch):
 
 
 def test_enrich_no_cluster_ids_in_events_is_a_noop(tmp_path, monkeypatch):
-    db_path = tmp_path / "provenance.db"
-    build_database(db_path, [], [])
+    db_path = _db_without_cluster_ids(tmp_path)
     schedd = _FakeSchedd({})
     monkeypatch.setattr(
         "htprovenance.history_enrich._get_schedd", lambda *a, **k: (schedd, SCHEDD)

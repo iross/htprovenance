@@ -195,6 +195,11 @@ at all (`log_monitor` events and older `job.assigned` events carry none). It
 is safe to re-run — cluster_ids already enriched from that schedd are skipped
 unless `--full-rescan` is passed. Requires `htcondor2` (Linux only).
 
+Both enrich commands work from what `db build` (or `scan --db`) already put in
+the database, so they exit with an error, and create nothing, when `--db`
+names a file that doesn't exist or holds no events (`enrich-history` also
+accepts `condor_history` rows from `scan --db`).
+
 `job.assigned` events record the schedd from `GlobalJobId`. Events captured
 before that have none; `enrich-jobad` skips them with a warning unless
 `--schedd` supplies one.

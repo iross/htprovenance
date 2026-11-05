@@ -292,6 +292,39 @@ def _row_from_jobad_event(event: dict) -> dict:
     return row
 
 
+def require_enrich_input(db_path: str | Path, tables: tuple[str, ...]) -> None:
+    """Fail fast when db_path has nothing for an enrich command to read.
+
+    sqlite3.connect creates a missing file, so without this check a mistyped
+    --db (or one that `db build` never wrote) silently "succeeds" against a
+    new, empty database and reports zero rows.
+
+    Args:
+        db_path: Path to the provenance SQLite database.
+        tables: Tables the command reads its jobs from; at least one must
+            have a row.
+
+    Raises:
+        FileNotFoundError: if db_path does not exist (it is not created).
+        ValueError: if every table in tables is missing or empty.
+    """
+    path = Path(db_path)
+    build_hint = f"run `htprovenance-query db build --db {path}` first"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist; {build_hint}")
+    conn = sqlite3.connect(path)
+    try:
+        for table in tables:
+            try:
+                if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                    return
+            except sqlite3.OperationalError:  # table doesn't exist yet
+                continue
+    finally:
+        conn.close()
+    raise ValueError(f"{path} has no rows in {' or '.join(tables)}; {build_hint}")
+
+
 def enrich_from_jobad_events(db_path: str | Path, *, default_schedd: str | None = None) -> int:
     """Mirror job.assigned events (jobad.py's in-job $_CONDOR_JOB_AD capture) into condor_history.
 
@@ -322,7 +355,12 @@ def enrich_from_jobad_events(db_path: str | Path, *, default_schedd: str | None 
 
     Returns:
         Number of rows written.
+
+    Raises:
+        FileNotFoundError, ValueError: if db_path is missing or has no events
+            (see require_enrich_input).
     """
+    require_enrich_input(db_path, ("events",))
     now = datetime.now(timezone.utc).isoformat()
     conn = sqlite3.connect(db_path)
     try:
@@ -501,7 +539,10 @@ def enrich_from_condor_history(
 
     Raises:
         ImportError: if htcondor2 (a Linux-only dependency) is not installed.
+        FileNotFoundError, ValueError: if db_path is missing or has neither
+            events nor condor_history rows (see require_enrich_input).
     """
+    require_enrich_input(db_path, ("events", "condor_history"))
     on_progress = on_progress or _noop_progress
 
     now = datetime.now(timezone.utc).isoformat()

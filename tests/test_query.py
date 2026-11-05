@@ -246,3 +246,86 @@ def _condor_history_rows(db_path: Path) -> list[tuple]:
         return conn.execute("SELECT schedd, cluster_id, proc_id FROM condor_history").fetchall()
     finally:
         conn.close()
+
+
+# --- enrich commands refuse a database with nothing to enrich ---
+
+
+@pytest.mark.parametrize("command", ["enrich-jobad", "enrich-history"])
+def test_cli_enrich_missing_db_exits_nonzero_without_creating_it(tmp_path, command):
+    db_path = tmp_path / "prov.db"
+
+    result = runner.invoke(app, ["db", command, "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "does not exist" in result.output
+    assert "db build" in result.output
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("command", ["enrich-jobad", "enrich-history"])
+def test_cli_enrich_unbuilt_db_exits_nonzero(tmp_path, command):
+    from htprovenance.db import build_database
+
+    db_path = tmp_path / "prov.db"
+    build_database(db_path, [], [tmp_path / "no-events-here"])
+
+    result = runner.invoke(app, ["db", command, "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "has no rows in events" in result.output
+
+
+def test_cli_enrich_jobad_ignores_condor_history_rows(tmp_path):
+    """enrich-jobad reads only events; a db filled by scan --db alone has nothing for it."""
+    db_path = tmp_path / "prov.db"
+    log_file = tmp_path / "metl.log"
+    log_file.write_text(_EXECUTING_ONLY_LOG)
+    scan = ["scan", str(log_file), "--db", str(db_path), "--schedd", "ap2002.chtc.wisc.edu"]
+    assert runner.invoke(app, scan).exit_code == 0
+
+    result = runner.invoke(app, ["db", "enrich-jobad", "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "has no rows in events;" in result.output
+
+
+def test_require_enrich_input_accepts_condor_history_rows(tmp_path):
+    """enrich-history can start from scan --db rows alone, with no events."""
+    from htprovenance.history_enrich import require_enrich_input
+
+    db_path = tmp_path / "prov.db"
+    log_file = tmp_path / "metl.log"
+    log_file.write_text(_EXECUTING_ONLY_LOG)
+    scan = ["scan", str(log_file), "--db", str(db_path), "--schedd", "ap2002.chtc.wisc.edu"]
+    assert runner.invoke(app, scan).exit_code == 0
+
+    require_enrich_input(db_path, ("events", "condor_history"))
+
+
+def test_cli_enrich_jobad_built_db_succeeds(tmp_path):
+    from htprovenance.db import build_database
+
+    event_dir = tmp_path / "provenance"
+    event_dir.mkdir()
+    (event_dir / "r1.ndjson").write_text(
+        json.dumps({"type": "job.submitted", "run_id": "r1", "ts": "t"}) + "\n"
+    )
+    db_path = tmp_path / "prov.db"
+    build_database(db_path, [], [event_dir])
+
+    result = runner.invoke(app, ["db", "enrich-jobad", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Wrote 0 row(s)" in result.output
+
+
+def test_cli_enrich_db_without_provenance_tables_exits_nonzero(tmp_path):
+    """An existing file that isn't a provenance database (no tables at all)."""
+    db_path = tmp_path / "prov.db"
+    db_path.touch()
+
+    result = runner.invoke(app, ["db", "enrich-history", "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "has no rows in events or condor_history" in result.output

@@ -369,14 +369,18 @@ def db_enrich_history(
     """
     from htprovenance.history_enrich import enrich_from_condor_history
 
-    stats = enrich_from_condor_history(
-        db,
-        schedd_name=schedd,
-        pool=pool,
-        full_rescan=full_rescan,
-        batch_size=batch_size,
-        on_progress=typer.echo,
-    )
+    try:
+        stats = enrich_from_condor_history(
+            db,
+            schedd_name=schedd,
+            pool=pool,
+            full_rescan=full_rescan,
+            batch_size=batch_size,
+            on_progress=typer.echo,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
     typer.echo(str(stats))
 
 
@@ -400,7 +404,11 @@ def db_enrich_jobad(
     """
     from htprovenance.history_enrich import enrich_from_jobad_events
 
-    written = enrich_from_jobad_events(db, default_schedd=schedd)
+    try:
+        written = enrich_from_jobad_events(db, default_schedd=schedd)
+    except (FileNotFoundError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
     typer.echo(f"Wrote {written} row(s) to {db} (condor_history, source=jobad)")
 
 
