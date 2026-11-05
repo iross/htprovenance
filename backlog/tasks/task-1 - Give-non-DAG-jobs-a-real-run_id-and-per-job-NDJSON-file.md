@@ -4,7 +4,7 @@ title: Default run_id for non-DAG jobs and record the schedd
 status: In Progress
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-04 22:39'
+updated_date: '2026-11-05 18:15'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -84,4 +84,6 @@ Follow-up (user decision, 2026-11-04): non-DAG jobs (no PROVENANCE_RUN_ID, no PR
 Not changed: site_info.json (top-level, read by watcher.py's _load_site_info and possibly mldag scripts) still comes back by default and is overwritten per proc in a shared directory; the .htprovenance_autocapture_done marker also comes back. Left for the user to decide since site_info.json is a cross-repo contract.
 
 site_info.json removed (user decision, 2026-11-04): it duplicated the job.assigned payload. watcher._load_site_info now reads the job's job.assigned event from autocapture.execute_node_event_log_path(ad). No code in the MLDAG, mldag, MLDAG_check or CHTC_MLDAG checkouts reads site_info.json outside their own vendored copies of these modules. The .htprovenance_autocapture_done marker still comes back with default transfer.
+
+Found 2026-11-05 on ap2002 (DAG 5a39c146, jobs 7811506/7814509/7817438/7825040, which ran rc2): with transfer_output_files = output, each job's sandbox output/provenance/<run_id>.ndjson replaced the shared file on return, wiping earlier jobs' events (incl. epochs) and the access point's PRE/log_monitor events. Pre-existing on main. Fixed in 9f201cc: every execute-node job (DAG or not) writes <run_id>.<cluster>.<proc>.ndjson; watcher epoch events go to the same file; query_run reads run + per-job files. repair.py keys job_name -> run_id by file stem, but execute-side events carry no job_name, so it is unaffected. Needs re-test on a real DAG with the branch installed in-job and on the AP.
 <!-- SECTION:NOTES:END -->
