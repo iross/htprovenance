@@ -119,6 +119,41 @@ def test_default_gpu_info_no_gpu_anywhere(monkeypatch):
 # --- gather_site_info ---
 
 
+@pytest.fixture(autouse=True)
+def _no_machine_ad(monkeypatch):
+    monkeypatch.delenv("_CONDOR_MACHINE_AD", raising=False)
+
+
+def _site_hostname(monkeypatch, tmp_path, machine_ad_text):
+    monkeypatch.setattr(autocapture, "_run", lambda cmd: "user-12.0-e4046.chtc.wisc.edu")
+    if machine_ad_text is not None:
+        machine_ad = tmp_path / ".machine.ad"
+        machine_ad.write_text(machine_ad_text)
+        monkeypatch.setenv("_CONDOR_MACHINE_AD", str(machine_ad))
+    site_info, _ = autocapture.gather_site_info({})
+    return site_info["hostname"]
+
+
+def test_gather_site_info_takes_hostname_from_machine_ad(monkeypatch, tmp_path):
+    machine_ad = 'Name = "slot1_3@e4046.chtc.wisc.edu"\nMachine = "e4046.chtc.wisc.edu"\n'
+
+    assert _site_hostname(monkeypatch, tmp_path, machine_ad) == "e4046.chtc.wisc.edu"
+
+
+@pytest.mark.parametrize("machine_ad", [None, "", "Cpus = 4\n", "Machine = undefined\n"])
+def test_gather_site_info_falls_back_to_hostname_command(monkeypatch, tmp_path, machine_ad):
+    assert _site_hostname(monkeypatch, tmp_path, machine_ad) == "user-12.0-e4046.chtc.wisc.edu"
+
+
+def test_gather_site_info_falls_back_when_machine_ad_file_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(autocapture, "_run", lambda cmd: "node01")
+    monkeypatch.setenv("_CONDOR_MACHINE_AD", str(tmp_path / "gone.ad"))
+
+    site_info, _ = autocapture.gather_site_info({})
+
+    assert site_info["hostname"] == "node01"
+
+
 def test_gather_site_info_uses_override(monkeypatch):
     monkeypatch.setattr(autocapture, "_run", lambda cmd: "node01.example.edu")
     monkeypatch.setenv("_CONDOR_SLOT", "slot1_1")
