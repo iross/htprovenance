@@ -1,17 +1,27 @@
 """Zero-config execute-node provenance auto-capture.
 
 Detects that the current process is running inside an HTCondor job and, if
-so, writes site_info.json (the contract htprovenance.watcher's
-_load_site_info already expects) and emits a job.assigned event -- with no
-call required from the training script itself. See htprovenance/_autorun.py
-for the interpreter-startup hook that makes this actually zero-config (a .pth
-file, installed by this package's build hook -- see hatch_build.py -- runs
-_autorun at the start of every Python process in an environment where this
-package is installed).
+so, emits a job.assigned event recording where it runs -- with no call
+required from the training script itself. htprovenance.watcher reads that
+event back (see execute_node_event_log_path) to stamp checkpoint sidecars.
+See htprovenance/_autorun.py for the interpreter-startup hook that makes this
+actually zero-config (a .pth file, installed by this package's build hook --
+see hatch_build.py -- runs _autorun at the start of every Python process in an
+environment where this package is installed).
 
 Detection reuses $_CONDOR_JOB_AD, the same env var htprovenance.jobad
 already relies on to locate the job's ClassAd snapshot (see its module
 docstring) -- one detection signal, not two independently-drifting ones.
+
+run_id for an execute-node job is $PROVENANCE_RUN_ID when set (mldag's
+generated DAGs set it). Otherwise -- a plain condor_submit, or a hand-written
+DAG -- it is the job's JobBatchName, else cluster-<ClusterId>. Every
+execute-node job writes its own <run_id>.<cluster>.<proc>.ndjson, so jobs
+returning output to a shared directory never overwrite each other's file (nor
+the access point's <run_id>.ndjson). mldag's jobs write it under
+output/provenance; other jobs at the top level of their sandbox, so default
+output transfer brings it back. See execute_node_run_id /
+execute_node_log_dir / execute_node_ndjson_stem.
 
 Processes on the access point see $_CONDOR_JOB_AD too: DAGMan's PRE/POST
 scripts inherit DAGMan's own (scheduler-universe) ad, and SERVICE nodes run
@@ -43,7 +53,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from htprovenance.events import _DEFAULT_LOG_DIR, emit_event
+from htprovenance.events import _DEFAULT_LOG_DIR, emit_event, event_log_path
 from htprovenance.jobad import capture_job_ad_fields
 from htprovenance.post import parse_classad
 
@@ -113,6 +123,88 @@ def submit_host_capture_target(ad: dict) -> tuple[str, str, int | None] | None:
     return event_type, f"local-{cluster_id}", None
 
 
+def execute_node_run_id(ad: dict) -> str:
+    """Return the run_id for an execute-node job.
+
+    Resolution order: $PROVENANCE_RUN_ID, then the job's JobBatchName (several
+    submits sharing a batch name group under one run_id), then
+    cluster-<ClusterId> (one condor_submit is one run). "unknown" only when
+    the job ad is unreadable.
+    """
+    run_id = os.environ.get("PROVENANCE_RUN_ID")
+    if run_id:
+        return run_id
+    batch_name = ad.get("JobBatchName")
+    if batch_name:
+        return str(batch_name)
+    cluster_id = _ad_int(ad, "ClusterId")
+    if cluster_id is not None:
+        return f"cluster-{cluster_id}"
+    return "unknown"
+
+
+def execute_node_log_dir() -> Path:
+    """Return the directory an execute-node job writes its NDJSON into.
+
+    $PROVENANCE_LOG_DIR if set. Otherwise output/provenance for jobs with
+    $PROVENANCE_RUN_ID (mldag's DAGs, unchanged), and the top level of the
+    sandbox for any other job: HTCondor's default output transfer returns new
+    top-level files but not new subdirectories, so a plain condor_submit job
+    gets its provenance back without listing it in transfer_output_files.
+    """
+    log_dir = os.environ.get("PROVENANCE_LOG_DIR")
+    if log_dir:
+        return Path(log_dir)
+    if os.environ.get("PROVENANCE_RUN_ID"):
+        return Path(_DEFAULT_LOG_DIR)
+    return Path()
+
+
+def execute_node_event_log_path(ad: dict) -> Path:
+    """Return the NDJSON file this execute-node job's job.assigned event is written to.
+
+    Derived from the same environment and job ad as the write, so code running
+    later in the same job (htprovenance.watcher) can find the event again.
+    """
+    run_id = execute_node_run_id(ad)
+    stem = execute_node_ndjson_stem(run_id, ad) or run_id
+    return event_log_path(stem, execute_node_log_dir())
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+_MAX_STEM_RUN_ID_CHARS = 200
+
+
+def execute_node_ndjson_stem(run_id: str, ad: dict) -> str | None:
+    """Return the NDJSON file stem for an execute-node job, or None to use run_id.
+
+    <run_id>.<cluster>.<proc>: every job writes its own sandbox copy, and
+    output transfer replaces a same-named file in the directory it returns
+    to, so a per-run name would let each job's file clobber the previous
+    jobs' events and the access point's own <run_id>.ndjson. The cluster is
+    needed because a run_id (a DAG run, a JobBatchName) spans several
+    clusters. run_id can be free text (JobBatchName), so it's made
+    filename-safe here; the event itself keeps the original. None (use
+    run_id) only when the job ad lacks ClusterId/ProcId.
+    """
+    cluster_id = _ad_int(ad, "ClusterId")
+    proc_id = _ad_int(ad, "ProcId")
+    if cluster_id is None or proc_id is None:
+        return None
+    return f"{filename_safe_run_id(run_id)}.{cluster_id}.{proc_id}"
+
+
+def filename_safe_run_id(run_id: str) -> str:
+    """Return run_id as it appears at the start of a per-job NDJSON file name.
+
+    Characters other than letters, digits, '.', '_' and '-' become '_', the
+    result is capped in length, and leading dots are dropped so the file is
+    never hidden. Never contains glob metacharacters.
+    """
+    safe_run_id = _UNSAFE_FILENAME_CHARS.sub("_", run_id)[:_MAX_STEM_RUN_ID_CHARS]
+    return safe_run_id.lstrip(".") or "_"
+
+
 def default_gpu_info() -> tuple[dict, str]:
     """Best-effort, torch-free GPU model/count/id.
 
@@ -164,7 +256,7 @@ def gather_site_info(
     """Return (site_info, site_info_source).
 
     site_info is exactly the {hostname, slot, gpu_model, gpu_count, gpu_id}
-    shape watcher.py's _load_site_info splits out of site_info.json. Pass
+    shape watcher.py's _load_site_info splits out of the job.assigned event. Pass
     gpu_info to supply caller-detected values (e.g. pretrain_local.sh's own
     torch.cuda introspection, more precise than this module's nvidia-smi/proc
     fallback) instead of auto-detecting.
@@ -212,10 +304,10 @@ def capture_and_emit(
 ) -> dict | None:
     """Best-effort: record where this HTCondor job is running.
 
-    On an execute node, writes site_info.json and emits job.assigned under
-    $PROVENANCE_RUN_ID. For DAGMan and its SERVICE nodes on the access point,
-    emits dagman.started / service.started under dagman-<DAGMan cluster>
-    instead, without writing site_info.json or probing GPUs.
+    On an execute node, emits job.assigned under the run_id from
+    execute_node_run_id. For DAGMan and its SERVICE nodes on the access
+    point, emits dagman.started / service.started under
+    dagman-<DAGMan cluster> instead, without probing GPUs.
 
     Returns the emitted payload, or None if this isn't (detectably) an
     HTCondor job, this job was already captured (idempotency marker), or
@@ -227,11 +319,11 @@ def capture_and_emit(
         if not detect_condor_job():
             return None
         ad = parse_classad(os.environ["_CONDOR_JOB_AD"])
-        log_dir = Path(os.environ.get("PROVENANCE_LOG_DIR", _DEFAULT_LOG_DIR))
         target = submit_host_capture_target(ad)
         if target is not None:
+            log_dir = Path(os.environ.get("PROVENANCE_LOG_DIR", _DEFAULT_LOG_DIR))
             return _capture_submit_host(ad, target, log_dir, fields_file)
-        return _capture_execute_node(log_dir, gpu_info, fields_file)
+        return _capture_execute_node(ad, execute_node_log_dir(), gpu_info, fields_file)
     except Exception:  # noqa: BLE001 -- deliberately blind: AC#7's whole point
         # is that any failure here (best-effort) must never affect the
         # training job's own behavior, output, or exit code.
@@ -243,8 +335,8 @@ def main() -> None:
     import json
 
     parser = argparse.ArgumentParser(
-        description="Best-effort execute-node provenance auto-capture: write "
-        "site_info.json and emit a job.assigned event. Safe to call "
+        description="Best-effort execute-node provenance auto-capture: emit "
+        "a job.assigned event. Safe to call "
         "unconditionally -- no-ops outside an HTCondor job or if this job's "
         "sandbox was already captured."
     )
@@ -273,26 +365,20 @@ def main() -> None:
     print(json.dumps(payload) if payload is not None else "{}")
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _capture_execute_node(
-    log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
+    ad: dict, log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
 ) -> dict | None:
-    import json
-
     marker = Path(_MARKER_FILENAME)
     if marker.exists():
         return None
-    run_id = os.environ.get("PROVENANCE_RUN_ID", "unknown")
+    run_id = execute_node_run_id(ad)
     site_info, site_info_source = gather_site_info(gpu_info)
     payload = {**site_info, **gather_env_info(), **capture_job_ad_fields(fields_file)}
-    Path("site_info.json").write_text(json.dumps(payload, indent=2))
     emit_event(
         "job.assigned",
         run_id,
         log_dir=log_dir,
+        ndjson_stem=execute_node_ndjson_stem(run_id, ad),
         source="execute_node_autocapture",
         site_info_source=site_info_source,
         **payload,
@@ -317,6 +403,17 @@ def _capture_submit_host(
         **capture_job_ad_fields(fields_file),
         "dagman_cluster_id": dagman_cluster_id,
     }
-    emit_event(event_type, run_id, log_dir=log_dir, source="submit_host_autocapture", **payload)
+    emit_event(
+        event_type,
+        run_id,
+        log_dir=log_dir,
+        ndjson_stem=None,
+        source="submit_host_autocapture",
+        **payload,
+    )
     marker.write_text("")
     return payload
+
+
+if __name__ == "__main__":
+    main()

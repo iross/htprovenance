@@ -144,6 +144,17 @@ def run_id_from_classad(ad: dict) -> str:
     return m.group(1) if m else "unknown"
 
 
+def schedd_from_global_job_id(global_job_id: str) -> str | None:
+    """Return the schedd name from a GlobalJobId, or None if it isn't one.
+
+    GlobalJobId is "<schedd name>#<cluster>.<proc>#<qdate>". ClusterIds are only
+    unique per schedd, so this is what tells two jobs with the same
+    (cluster_id, proc_id) on different access points apart.
+    """
+    schedd, separator, _ = str(global_job_id).partition("#")
+    return schedd if separator and schedd else None
+
+
 def resource_fields_from_classad(ad: dict, mapping: dict[str, str] | None = None) -> dict:
     """Return the subset of ClassAd fields that map to the provenance schema.
 

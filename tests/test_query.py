@@ -119,6 +119,36 @@ def test_query_run_skips_malformed_lines(tmp_path):
     assert len(result) == 2
 
 
+def _event(event_type: str, run_id: str, ts: str) -> dict:
+    return {"schema_version": "1.0", "type": event_type, "run_id": run_id, "ts": ts}
+
+
+def test_query_run_merges_run_file_and_per_job_files(tmp_path):
+    _write_events(tmp_path, "r1", [_event("job.submitted", "r1", "2026-01-01T00:00:00")])
+    _write_events(tmp_path, "r1.555.0", [_event("job.assigned", "r1", "2026-01-01T00:01:00")])
+    _write_events(tmp_path, "r1.556.0", [_event("epoch.completed", "r1", "2026-01-01T00:02:00")])
+
+    result = query_run("r1", tmp_path)
+
+    assert [e["type"] for e in result] == ["job.submitted", "job.assigned", "epoch.completed"]
+
+
+def test_query_run_reads_per_job_files_without_run_file(tmp_path):
+    _write_events(tmp_path, "cluster-555.555.0", [_event("job.assigned", "cluster-555", "t")])
+
+    assert [e["type"] for e in query_run("cluster-555", tmp_path)] == ["job.assigned"]
+
+
+def test_query_run_matches_sanitized_file_names_by_event_run_id(tmp_path):
+    """'my sweep' is filed as my_sweep.*; 'my_sweep' and 'my.sweep' runs must not leak in."""
+    _write_events(tmp_path, "my_sweep.555.0", [_event("job.assigned", "my sweep", "t1")])
+    _write_events(tmp_path, "my_sweep.556.0", [_event("job.assigned", "my_sweep", "t2")])
+    _write_events(tmp_path, "my.sweep.557.0", [_event("job.assigned", "my.sweep", "t3")])
+
+    assert [e["ts"] for e in query_run("my sweep", tmp_path)] == ["t1"]
+    assert [e["ts"] for e in query_run("my", tmp_path)] == []
+
+
 # --- CLI: lineage ---
 
 
@@ -174,3 +204,128 @@ def test_cli_events_json_output(tmp_path):
 def test_cli_events_missing_run_exits_nonzero(tmp_path):
     result = runner.invoke(app, ["events", "no-such-run", "--log-dir", str(tmp_path)])
     assert result.exit_code != 0
+
+
+# --- scan --db / --schedd ---
+
+_EXECUTING_ONLY_LOG = (
+    "001 (322.000.000) 2026-11-04 15:54:00 Job executing on host: <10.0.0.1:1234>\n...\n"
+)
+
+
+def test_cli_scan_db_without_schedd_exits_nonzero_and_writes_nothing(tmp_path):
+    log = tmp_path / "batch.log"
+    log.write_text(_EXECUTING_ONLY_LOG)
+    db_path = tmp_path / "provenance.db"
+
+    result = runner.invoke(app, ["scan", str(log), "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "--schedd" in result.output
+    assert not db_path.exists() or _condor_history_rows(db_path) == []
+
+
+def test_cli_scan_db_with_schedd_writes_row(tmp_path):
+    log = tmp_path / "batch.log"
+    log.write_text(_EXECUTING_ONLY_LOG)
+    db_path = tmp_path / "provenance.db"
+
+    result = runner.invoke(
+        app, ["scan", str(log), "--db", str(db_path), "--schedd", "ap2002.chtc.wisc.edu"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _condor_history_rows(db_path) == [("ap2002.chtc.wisc.edu", 322, 0)]
+
+
+def _condor_history_rows(db_path: Path) -> list[tuple]:
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute("SELECT schedd, cluster_id, proc_id FROM condor_history").fetchall()
+    finally:
+        conn.close()
+
+
+# --- enrich commands refuse a database with nothing to enrich ---
+
+
+@pytest.mark.parametrize("command", ["enrich-jobad", "enrich-history"])
+def test_cli_enrich_missing_db_exits_nonzero_without_creating_it(tmp_path, command):
+    db_path = tmp_path / "prov.db"
+
+    result = runner.invoke(app, ["db", command, "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "does not exist" in result.output
+    assert "db build" in result.output
+    assert not db_path.exists()
+
+
+@pytest.mark.parametrize("command", ["enrich-jobad", "enrich-history"])
+def test_cli_enrich_unbuilt_db_exits_nonzero(tmp_path, command):
+    from htprovenance.db import build_database
+
+    db_path = tmp_path / "prov.db"
+    build_database(db_path, [], [tmp_path / "no-events-here"])
+
+    result = runner.invoke(app, ["db", command, "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "has no rows in events" in result.output
+
+
+def test_cli_enrich_jobad_ignores_condor_history_rows(tmp_path):
+    """enrich-jobad reads only events; a db filled by scan --db alone has nothing for it."""
+    db_path = tmp_path / "prov.db"
+    log_file = tmp_path / "metl.log"
+    log_file.write_text(_EXECUTING_ONLY_LOG)
+    scan = ["scan", str(log_file), "--db", str(db_path), "--schedd", "ap2002.chtc.wisc.edu"]
+    assert runner.invoke(app, scan).exit_code == 0
+
+    result = runner.invoke(app, ["db", "enrich-jobad", "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "has no rows in events;" in result.output
+
+
+def test_require_enrich_input_accepts_condor_history_rows(tmp_path):
+    """enrich-history can start from scan --db rows alone, with no events."""
+    from htprovenance.history_enrich import require_enrich_input
+
+    db_path = tmp_path / "prov.db"
+    log_file = tmp_path / "metl.log"
+    log_file.write_text(_EXECUTING_ONLY_LOG)
+    scan = ["scan", str(log_file), "--db", str(db_path), "--schedd", "ap2002.chtc.wisc.edu"]
+    assert runner.invoke(app, scan).exit_code == 0
+
+    require_enrich_input(db_path, ("events", "condor_history"))
+
+
+def test_cli_enrich_jobad_built_db_succeeds(tmp_path):
+    from htprovenance.db import build_database
+
+    event_dir = tmp_path / "provenance"
+    event_dir.mkdir()
+    (event_dir / "r1.ndjson").write_text(
+        json.dumps({"type": "job.submitted", "run_id": "r1", "ts": "t"}) + "\n"
+    )
+    db_path = tmp_path / "prov.db"
+    build_database(db_path, [], [event_dir])
+
+    result = runner.invoke(app, ["db", "enrich-jobad", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Wrote 0 row(s)" in result.output
+
+
+def test_cli_enrich_db_without_provenance_tables_exits_nonzero(tmp_path):
+    """An existing file that isn't a provenance database (no tables at all)."""
+    db_path = tmp_path / "prov.db"
+    db_path.touch()
+
+    result = runner.invoke(app, ["db", "enrich-history", "--db", str(db_path)])
+
+    assert result.exit_code == 1
+    assert "has no rows in events or condor_history" in result.output

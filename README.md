@@ -22,7 +22,7 @@ plotting/dataframe stack that DAG generation and reporting need.
 ## What it does
 
 Provenance is captured from three independent places and merged into one SQLite
-database keyed by `(cluster_id, proc_id)`:
+database keyed by `(schedd, cluster_id, proc_id)`:
 
 - **Submit side.** `htprovenance-pre` / `htprovenance-post` run as DAGMan
   `SCRIPT PRE`/`POST` and emit `job.submitted` / `job.completed` / `job.failed`
@@ -40,6 +40,49 @@ database keyed by `(cluster_id, proc_id)`:
   `condor_history`; `htprovenance-query db enrich-jobad` mirrors the in-job
   capture into the same table; a raw event log can be scanned directly for jobs
   that were never instrumented at all.
+
+## Run IDs for jobs outside a generated DAG
+
+The execute-side capture files its `job.assigned` event under a `run_id`,
+resolved from the job's environment and ClassAd:
+
+1. `PROVENANCE_RUN_ID`, if set. mldag's generated DAGs set it.
+2. `JobBatchName`, if set. Submits that share a batch name share a `run_id`.
+   A hand-written DAG gets DAGMan's default batch name
+   (`<dagfile>+<DAGMan cluster>`), so its nodes group per DAG run.
+3. `cluster-<ClusterId>` otherwise: one `condor_submit` is one run.
+
+Events written inside a job (`job.assigned` and the checkpoint watcher's
+`epoch.*` events) go to that job's own `<run_id>.<cluster>.<proc>.ndjson`.
+Output transfer replaces a same-named file in the directory it returns to, so
+with one shared `<run_id>.ndjson` each finishing job would overwrite the
+events of the jobs before it, and the access point's own events for the run.
+The access point's DAGMan scripts and log monitor keep appending to
+`<run_id>.ndjson`; `db build` and `htprovenance-query events <run_id>` read
+both. The file name has unsafe characters in the `run_id` replaced with `_`
+and is capped in length; the `run_id` inside each event keeps the original
+text, and `db build` reads it from there.
+
+The event also records `schedd` (taken from `GlobalJobId`), since a
+`ClusterId` is only unique per access point.
+
+For cases 2 and 3 the file is written at the top level of the job's sandbox
+(unless `$PROVENANCE_LOG_DIR` says otherwise), because HTCondor's default
+output transfer returns new top-level files but not new subdirectories.
+Tested on CHTC's ap2001, 2026-11-04: without `transfer_output_files`, a
+top-level file came back and `output/provenance/` did not. So:
+
+- With default output transfer, the `.ndjson` files land in the job's
+  submit directory (its `initialdir`) next to its other outputs. Load them with
+  `htprovenance-query db build --event-dir <that directory>`.
+- If the job lists `transfer_output_files`, add the file to it, e.g.
+  `transfer_output_files = results.csv, $(batch_name).$(ClusterId).$(ProcId).ndjson`
+  when `batch_name` is set (and contains only letters, digits, `.`, `_` and
+  `-`, so the file name isn't altered), or
+  `cluster-$(ClusterId).$(ClusterId).$(ProcId).ndjson` when it isn't.
+
+mldag's jobs (which set `PROVENANCE_RUN_ID`) write their per-job file under
+`output/provenance/`, which their `transfer_output_files = output` brings back.
 
 ## CLI
 
@@ -101,6 +144,9 @@ htprovenance-query scan metl.log --cluster-id 12345 --cluster-id 12399
 # instead of/alongside printing them
 htprovenance-query scan metl.log --db provenance.db
 
+# Same, naming the schedd when the log doesn't (see below)
+htprovenance-query scan metl.log --db provenance.db --schedd ap2002.chtc.wisc.edu
+
 # Backfill provenance.db's condor_history table from HTCondor job history
 # (final host, exit code, hold reasons, requested vs. used resources)
 htprovenance-query db enrich-history --schedd <name>
@@ -108,20 +154,32 @@ htprovenance-query db enrich-history --schedd <name>
 # Mirror job.assigned events (jobad.py's in-job $_CONDOR_JOB_AD capture,
 # emitted immediately at job start) into condor_history too
 htprovenance-query db enrich-jobad
+
+# Include job.assigned events captured before the schedd was recorded
+htprovenance-query db enrich-jobad --schedd ap2002.chtc.wisc.edu
 ```
 
 `scan` parses any HTCondor event log directly; if `--log-dir`/
 `--provenance-log-dir` happen to point at a DAGMan provenance run's classad or
 NDJSON directories, matching jobs are enriched with `run_id`/`job_name` too.
-Jobs are keyed by `(cluster_id, proc_id)`, not `cluster_id` alone, since a
-`queue N` job array puts many procs under one cluster.
+Jobs are keyed by `(schedd, cluster_id, proc_id)`: a `queue N` job array puts
+many procs under one cluster, and a `ClusterId` is only unique per schedd, so
+one database can hold jobs from several access points.
+
+`scan` takes the schedd from the `alias=` host name in each job's submit event
+(`Job submitted from host: <...&alias=ap2002.chtc.wisc.edu&...>`), which is the
+schedd's name for a default schedd. `--schedd` sets it for every job instead.
+Use it when the log has no submit events or no alias, or when your schedd's
+name differs from its host name; otherwise `scan` and `enrich-history` rows
+for the same job won't merge. `scan --db` refuses to write when any job is
+left without a schedd.
 
 `condor_history` holds rows from any of three sources — `db enrich-history`
 (queried from HTCondor), `scan --db` (parsed from a raw event log), or
 `db enrich-jobad` (mirrored from `job.assigned` events already in the `events`
 table) — distinguished by its `source` column, since they can disagree and
 none is definitively more current than the others. Writing from more than one
-for the same `(cluster_id, proc_id)` never produces duplicate rows or a
+for the same `(schedd, cluster_id, proc_id)` never produces duplicate rows or a
 clobber: a write merges column-by-column into any existing row (a column the
 new write doesn't know about keeps its previous value), and `source` becomes
 e.g. `condor_history,jobad` once both have contributed. `enrich-jobad`
@@ -131,9 +189,20 @@ so those fields would be near-zero placeholders rather than real usage — use
 `enrich-history` or `scan` for those.
 
 `db enrich-history` queries `condor_history` via the HTCondor Python bindings
-(not the CLI) for every cluster_id already in `provenance.db`'s `events`
-table, and is safe to re-run — already-enriched cluster_ids are skipped
+(not the CLI) for every cluster_id already in `provenance.db` that belongs to
+the schedd being queried: recorded on that schedd, or recorded with no schedd
+at all (`log_monitor` events and older `job.assigned` events carry none). It
+is safe to re-run — cluster_ids already enriched from that schedd are skipped
 unless `--full-rescan` is passed. Requires `htcondor2` (Linux only).
+
+Both enrich commands work from what `db build` (or `scan --db`) already put in
+the database, so they exit with an error, and create nothing, when `--db`
+names a file that doesn't exist or holds no events (`enrich-history` also
+accepts `condor_history` rows from `scan --db`).
+
+`job.assigned` events record the schedd from `GlobalJobId`. Events captured
+before that have none; `enrich-jobad` skips them with a warning unless
+`--schedd` supplies one.
 
 ## Relationship to mldag
 

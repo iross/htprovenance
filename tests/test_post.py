@@ -13,6 +13,7 @@ from htprovenance.post import (
     parse_classad,
     resource_fields_from_classad,
     run_id_from_classad,
+    schedd_from_global_job_id,
 )
 
 
@@ -386,3 +387,17 @@ def test_main_run_id_flag_used_when_ad_missing(tmp_path):
     events = _read_events(tmp_path, "abc123")
     assert events[0]["run_id"] == "abc123"
     assert events[0]["type"] == "job.completed"
+
+
+@pytest.mark.parametrize(
+    ("global_job_id", "expected"),
+    [
+        ("ap2002.chtc.wisc.edu#7810859.0#1793900000", "ap2002.chtc.wisc.edu"),
+        ("ap2002.chtc.wisc.edu#7810859.0", "ap2002.chtc.wisc.edu"),
+        ("no-separator", None),
+        ("#7810859.0#1793900000", None),
+        ("", None),
+    ],
+)
+def test_schedd_from_global_job_id(global_job_id, expected):
+    assert schedd_from_global_job_id(global_job_id) == expected

@@ -100,19 +100,22 @@ CREATE TABLE IF NOT EXISTS event_file_state (
 -- Per-job summary data, from condor_history (history_enrich.py), a raw
 -- event-log scan (event_log_scan.py), or an in-job $_CONDOR_JOB_AD capture
 -- mirrored from the `events` table (jobad.py, via history_enrich.py's
--- enrich_from_jobad_events) -- `source` names which have contributed to a
--- row (comma-joined when more than one has). Keyed by (cluster_id,
+-- enrich_from_jobad_events) -- `source` names which have contributed to a row
+-- (comma-joined when more than one has). Keyed by (schedd, cluster_id,
 -- proc_id): a single cluster_id can hold many procs (`queue N` job arrays),
--- so cluster_id alone is not unique (see task-29 -- event_log_scan.py hit
--- the identical bug). A write from one source merges into an existing row
--- column-by-column (COALESCE, new value wins only where the new write
--- actually has one) rather than replacing it outright, so writing from
--- multiple sources for the same job accumulates data instead of one
--- clobbering another's fields with NULL. The jobad source deliberately
+-- and ClusterIds are only unique per schedd, so a db collecting jobs from
+-- more than one access point needs the schedd to tell them apart. schedd is
+-- NOT NULL because SQLite treats NULLs in a primary key as distinct, which
+-- would stop writes from different sources merging. A write from one source
+-- merges into an existing row column-by-column (COALESCE, new value wins only
+-- where the new write actually has one) rather than replacing it outright, so
+-- writing from multiple sources for the same job accumulates data instead of
+-- one clobbering another's fields with NULL. The jobad source deliberately
 -- never contributes remote_wall_clock_s/cpus_usage/memory_usage_mb/
 -- gpus_usage: it captures the job ad at submission, before the job has run,
 -- so those fields would be near-zero placeholders, not real usage.
 CREATE TABLE IF NOT EXISTS condor_history (
+    schedd            TEXT NOT NULL,
     cluster_id        INTEGER NOT NULL,
     proc_id           INTEGER NOT NULL DEFAULT 0,
     run_id            TEXT,
@@ -147,7 +150,7 @@ CREATE TABLE IF NOT EXISTS condor_history (
     event_log_json    TEXT,
     jobad_json        TEXT,
     queried_at        TEXT NOT NULL,
-    PRIMARY KEY (cluster_id, proc_id)
+    PRIMARY KEY (schedd, cluster_id, proc_id)
 );
 """
 
@@ -190,6 +193,9 @@ def _drop_stale_condor_history(conn: sqlite3.Connection) -> None:
     column: source` the moment enrich-history/enrich-jobad/scan --db runs
     against it under a newer release. The same applies to any later column
     added to the schema (e.g. 'machine') -- listed alongside 'source' below.
+    'schedd' also marks the switch of the primary key from (cluster_id,
+    proc_id) to (schedd, cluster_id, proc_id): the two arrived together, so a
+    table without the column has the old key.
 
     Unlike checkpoints/events, condor_history has no incremental ingestion
     state (no byte offsets or mtimes to preserve) -- every row is fully
@@ -199,7 +205,7 @@ def _drop_stale_condor_history(conn: sqlite3.Connection) -> None:
     rebuild of checkpoints/events too.
     """
     columns = {row[1] for row in conn.execute("PRAGMA table_info(condor_history)")}
-    missing = {"source", "machine", "glidein_resource_name", "job_batch_name"} - columns
+    missing = {"source", "machine", "glidein_resource_name", "job_batch_name", "schedd"} - columns
     if columns and missing:
         logger.warning(
             "condor_history predates the current schema (missing %s); "

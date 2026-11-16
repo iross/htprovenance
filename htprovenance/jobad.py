@@ -23,19 +23,21 @@ from htprovenance.post import (
     load_classad_field_mapping,
     parse_classad,
     resource_fields_from_classad,
+    schedd_from_global_job_id,
 )
 
 
 def capture_job_ad_fields(fields_file: str | Path | None = None) -> dict:
-    """Return the configured subset of $_CONDOR_JOB_AD's fields, plus cluster_id/proc_id.
+    """Return the configured subset of $_CONDOR_JOB_AD's fields, plus schedd/cluster_id/proc_id.
 
     Reuses the same field-mapping file, default mapping, and sensitive-key
     blocklist as post.py's ClassAd handling (see load_classad_field_mapping).
-    cluster_id/proc_id are always included when present in the ad -- unlike
-    the configurable fields, they're structural identifiers rather than
-    provenance content, so callers that want to key data by job (e.g.
-    mirroring this into provenance.db's condor_history table) always have
-    them without needing to add them to a fields_file.
+    schedd (from GlobalJobId), cluster_id and proc_id are always included
+    when present in the ad -- unlike the configurable fields, they're
+    structural identifiers rather than provenance content, so callers that
+    want to key data by job (e.g. mirroring this into provenance.db's
+    condor_history table, keyed by (schedd, cluster_id, proc_id)) always
+    have them without needing to add them to a fields_file.
 
     Returns {} if $_CONDOR_JOB_AD isn't set or unreadable (e.g. running
     outside HTCondor, or an HTCondor version that doesn't set it) -- this is
@@ -53,6 +55,9 @@ def capture_job_ad_fields(fields_file: str | Path | None = None) -> dict:
         fields["cluster_id"] = ad["ClusterId"]
     if "ProcId" in ad:
         fields["proc_id"] = ad["ProcId"]
+    schedd = schedd_from_global_job_id(ad.get("GlobalJobId", ""))
+    if schedd:
+        fields["schedd"] = schedd
     return fields
 
 

@@ -94,3 +94,11 @@ def test_emit_event_separate_runs_separate_files(tmp_path):
     assert event_log_path("run-aaa", tmp_path).exists()
     assert event_log_path("run-bbb", tmp_path).exists()
     assert event_log_path("run-aaa", tmp_path) != event_log_path("run-bbb", tmp_path)
+
+
+def test_emit_event_ndjson_stem_overrides_file_name_not_run_id(tmp_path):
+    emit_event("job.assigned", RUN_ID, log_dir=tmp_path, ndjson_stem="other.1.0")
+
+    assert not event_log_path(RUN_ID, tmp_path).exists()
+    [event] = _read_events(tmp_path, "other.1.0")
+    assert event["run_id"] == RUN_ID

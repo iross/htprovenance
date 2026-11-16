@@ -104,3 +104,23 @@ def test_capture_job_ad_fields_still_enforces_sensitive_key_blocklist(tmp_path):
     with patch.dict("os.environ", {"_CONDOR_JOB_AD": str(job_ad)}):
         with pytest.raises(ValueError, match="Environment"):
             capture_job_ad_fields(fields_file)
+
+
+def test_capture_job_ad_fields_includes_schedd_from_global_job_id(tmp_path):
+    job_ad = tmp_path / ".job.ad"
+    _write_job_ad(
+        job_ad, {**SAMPLE_JOB_AD, "GlobalJobId": "ap2001.chtc.wisc.edu#12345.0#1793900000"}
+    )
+    with patch.dict("os.environ", {"_CONDOR_JOB_AD": str(job_ad)}):
+        fields = capture_job_ad_fields()
+
+    assert fields["schedd"] == "ap2001.chtc.wisc.edu"
+
+
+def test_capture_job_ad_fields_no_schedd_without_global_job_id(tmp_path):
+    job_ad = tmp_path / ".job.ad"
+    _write_job_ad(job_ad, SAMPLE_JOB_AD)
+    with patch.dict("os.environ", {"_CONDOR_JOB_AD": str(job_ad)}):
+        fields = capture_job_ad_fields()
+
+    assert "schedd" not in fields
