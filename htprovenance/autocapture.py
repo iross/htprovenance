@@ -255,6 +255,21 @@ def default_gpu_info() -> tuple[dict, str]:
     )
 
 
+def _execute_point_hostname() -> str:
+    """Return the machine ad's Machine attribute, or "" when there is none.
+
+    Inside a container the hostname command returns the container's name
+    (e.g. user-1234.0-e4046.chtc.wisc.edu), not the execute point's. The
+    machine ad HTCondor puts in the sandbox names the execute point itself.
+    Processes on the access point have no $_CONDOR_MACHINE_AD.
+    """
+    machine_ad_path = os.environ.get("_CONDOR_MACHINE_AD")
+    if not machine_ad_path:
+        return ""
+    machine = parse_classad(machine_ad_path).get("Machine")
+    return machine if isinstance(machine, str) else ""
+
+
 def gather_site_info(
     gpu_info: dict | None = None, gpu_info_source: str = "torch_cuda"
 ) -> tuple[dict, str]:
@@ -266,7 +281,12 @@ def gather_site_info(
     torch.cuda introspection, more precise than this module's nvidia-smi/proc
     fallback) instead of auto-detecting.
     """
-    hostname = _run(["hostname", "-f"]) or _run(["hostname"]) or "unknown"
+    hostname = (
+        _execute_point_hostname()
+        or _run(["hostname", "-f"])
+        or _run(["hostname"])
+        or "unknown"
+    )
     slot = os.environ.get("_CONDOR_SLOT", "unknown")
     if gpu_info is not None:
         gpu, source = {**_GPU_INFO_DEFAULTS, **gpu_info}, gpu_info_source
