@@ -23,6 +23,10 @@ output/provenance; other jobs at the top level of their sandbox, so default
 output transfer brings it back. See execute_node_run_id /
 execute_node_log_dir / execute_node_ndjson_stem.
 
+job.assigned also carries a hash of the interpreter's installed packages;
+the list itself goes to packages.<hash>.json beside the NDJSON file (see
+htprovenance.packages).
+
 Processes on the access point see $_CONDOR_JOB_AD too: DAGMan's PRE/POST
 scripts inherit DAGMan's own (scheduler-universe) ad, and SERVICE nodes run
 as local-universe jobs. Those are recorded as dagman.started /
@@ -55,6 +59,7 @@ from pathlib import Path
 
 from htprovenance.events import _DEFAULT_LOG_DIR, emit_event, event_log_path
 from htprovenance.jobad import capture_job_ad_fields
+from htprovenance.packages import write_package_list
 from htprovenance.post import parse_classad
 
 _MARKER_FILENAME = ".htprovenance_autocapture_done"
@@ -299,6 +304,19 @@ def gather_env_info() -> dict:
     }
 
 
+def _package_set_fields(log_dir: Path) -> dict:
+    """Write this interpreter's package list beside the NDJSON; return its hash and count.
+
+    {} if the packages can't be listed or the file can't be written.
+    """
+    try:
+        set_hash, count = write_package_list(log_dir)
+    except Exception:  # noqa: BLE001 -- best-effort: job.assigned is still
+        # worth recording without the package fields.
+        return {}
+    return {"package_set_hash": set_hash, "package_count": count}
+
+
 def capture_and_emit(
     *, gpu_info: dict | None = None, fields_file: str | Path | None = None
 ) -> dict | None:
@@ -373,7 +391,12 @@ def _capture_execute_node(
         return None
     run_id = execute_node_run_id(ad)
     site_info, site_info_source = gather_site_info(gpu_info)
-    payload = {**site_info, **gather_env_info(), **capture_job_ad_fields(fields_file)}
+    payload = {
+        **site_info,
+        **gather_env_info(),
+        **_package_set_fields(log_dir),
+        **capture_job_ad_fields(fields_file),
+    }
     emit_event(
         "job.assigned",
         run_id,

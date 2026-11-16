@@ -4,7 +4,7 @@ title: In-job file hashing and lineage queries
 status: Done
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-16 18:47'
+updated_date: '2026-11-16 19:13'
 labels: []
 dependencies:
   - TASK-1
@@ -91,4 +91,6 @@ AC #9: timing job hashed a 2 GB file in 5.1 s (~400 MB/s) on e4046; documented i
 Automatic hashing for Python jobs (2026-11-16, user request: no per-job commands for Python jobs). htprovenance/_autorun.py now calls filehash.start_automatic_recording() when $_CONDOR_JOB_AD is set: the job's first Python process hashes inputs (guarded by a .htprovenance_inputs_hashed marker in the sandbox), and every Python process registers an atexit hook that records outputs. The hook reuses hashes for files whose size/mtime match the previous files.outputs event, writes no event when nothing changed, works from $_CONDOR_SCRATCH_DIR so a job that changed directory is still handled, skips DAGMan/SERVICE processes on the AP, and writes nothing to stdout/stderr. Applies to every job with htprovenance installed, including mldag's; HTPROVENANCE_NO_AUTORUN is the only off switch. Known limits (in README): files created after the last Python process exits are not hashed; files present at a Python exit and deleted later stay recorded; no exit recording on signal kill or os._exit. Unit-tested and run through a real interpreter exit locally; not yet run in a real HTCondor job (the ap-check kit loads the wheel via PYTHONPATH, which does not install the .pth hook).
 
 AC #9 reworded 2026-11-16 at the user's direction: hashing happens on the execute point once the file is in the sandbox, so the AP and the transfer mechanism (staged or not) don't matter. The 2 GB / 5.1 s (~400 MB/s, e4046) measurement satisfies it. Added HTPROVENANCE_NO_FILE_HASHES to turn off automatic hashing per job. Automatic hashing from the startup hook is still untested in a real HTCondor job.
+
+Automatic hashing verified in a real job 2026-11-16 on ap2002 (user run of the ap-check kit with an added 'auto' node, job 8762378.0 on e4031 in docker://python:3.12-slim, wheel pip-installed into a venv, no htprovenance-hash calls). All 21 checks passed: inputs hashed at first Python startup, outputs of two Python processes recorded after the job changed directory, a file written after the last Python process not recorded (documented limit), job.assigned recorded for the same job (python 3.12.16), nothing printed to job stdout/stderr, chain raw.csv -> auto_out.txt through 3 jobs. job.assigned still shows code_commit 'unknown' and a container-style hostname (iaross-8762378.0-e4031.chtc.wisc.edu). Second timing: 2 GB in 8.0 s (256 MB/s) on e2485. Still not exercised in a real job: URL inputs, OutputDestination, a .sif file in the sandbox.
 <!-- SECTION:NOTES:END -->

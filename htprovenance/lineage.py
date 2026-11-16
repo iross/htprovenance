@@ -27,7 +27,9 @@ from pathlib import Path
 from htprovenance.sidecar import sha256_file
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-_ENVIRONMENT_FIELDS = ("python", "cuda", "code_commit", "htprovenance_version")
+_ENVIRONMENT_FIELDS = (
+    "python", "cuda", "code_commit", "htprovenance_version", "package_count", "package_set_hash",
+)
 _EDGE_COLUMNS = (
     "schedd", "cluster_id", "proc_id", "role", "path", "sha256", "size", "status",
     "source", "destination_url", "run_id",
@@ -106,7 +108,7 @@ def _file_summary(edge: dict) -> dict:
 
 
 def _environment(conn: sqlite3.Connection, job: Job) -> dict:
-    """Return the python/cuda/code_commit/version fields of the job's job.assigned event."""
+    """Return the software fields (_ENVIRONMENT_FIELDS) of the job's job.assigned event."""
     row = conn.execute(
         "SELECT payload_json FROM events WHERE type = 'job.assigned' "
         "AND json_extract(payload_json, '$.schedd') = ? "

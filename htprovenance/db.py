@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from htprovenance.packages import LIST_FILE_GLOB, read_package_list
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = "provenance.db"
@@ -114,6 +116,16 @@ CREATE TABLE IF NOT EXISTS file_edges (
     PRIMARY KEY (schedd, cluster_id, proc_id, role, path)
 );
 CREATE INDEX IF NOT EXISTS idx_file_edges_sha256 ON file_edges(sha256);
+
+-- Installed Python packages, one copy per distinct set (packages.<set_hash>.json
+-- files, see htprovenance.packages). A job's job.assigned event names its set
+-- by package_set_hash, so jobs sharing an environment share these rows.
+CREATE TABLE IF NOT EXISTS package_sets (
+    set_hash TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    version  TEXT NOT NULL,
+    PRIMARY KEY (set_hash, name)
+);
 
 CREATE TABLE IF NOT EXISTS event_file_state (
     source_file TEXT PRIMARY KEY,
@@ -196,6 +208,8 @@ class BuildStats:
     checkpoints_skipped_malformed: int = 0
     events_ingested: int = 0
     events_skipped_malformed: int = 0
+    package_sets_ingested: int = 0
+    package_sets_skipped_malformed: int = 0
 
     def __str__(self) -> str:
         return (
@@ -203,7 +217,9 @@ class BuildStats:
             f"{self.checkpoints_skipped_unchanged} unchanged, "
             f"{self.checkpoints_skipped_malformed} malformed | "
             f"events: {self.events_ingested} ingested, "
-            f"{self.events_skipped_malformed} malformed"
+            f"{self.events_skipped_malformed} malformed | "
+            f"package sets: {self.package_sets_ingested} ingested, "
+            f"{self.package_sets_skipped_malformed} malformed"
         )
 
 
@@ -356,6 +372,24 @@ def _ingest_file_edges(conn: sqlite3.Connection, event: dict, *, where: str) -> 
         )
 
 
+def _ingest_package_list(conn: sqlite3.Connection, list_path: Path, *, stats: BuildStats) -> None:
+    """Store a packages.<set_hash>.json file's set, unless that set is already stored."""
+    try:
+        set_hash, packages = read_package_list(list_path)
+    except ValueError as exc:
+        stats.package_sets_skipped_malformed += 1
+        logger.warning("Skipping package list %s: %s", list_path, exc)
+        return
+    if conn.execute("SELECT 1 FROM package_sets WHERE set_hash = ?", (set_hash,)).fetchone():
+        return
+    conn.executemany(
+        "INSERT INTO package_sets (set_hash, name, version) VALUES (?, ?, ?)",
+        [(set_hash, name, version) for name, version in packages],
+    )
+    if packages:
+        stats.package_sets_ingested += 1
+
+
 def _ingest_event_file(
     conn: sqlite3.Connection,
     ndjson_path: Path,
@@ -465,7 +499,8 @@ def build_database(
         checkpoint_dirs: Directories searched recursively for
             *.ckpt.provenance.json sidecar files.
         event_dirs: Directories searched (non-recursively, matching how
-            NDJSON event logs are always written flat) for *.ndjson files.
+            NDJSON event logs are always written flat) for *.ndjson files
+            and packages.<set_hash>.json package lists.
         full_rescan: Re-ingest every checkpoint and re-read every event
             file from the beginning, ignoring recorded mtimes/offsets.
 
@@ -487,6 +522,8 @@ def build_database(
                 _ingest_event_file(
                     conn, ndjson_path, stats=stats, now=now, full_rescan=full_rescan
                 )
+            for list_path in sorted(Path(d).glob(LIST_FILE_GLOB)):
+                _ingest_package_list(conn, list_path, stats=stats)
         conn.commit()
     finally:
         conn.close()

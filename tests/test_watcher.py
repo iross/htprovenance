@@ -127,7 +127,7 @@ def test_main_in_dag_job_writes_epochs_to_the_jobs_own_file(monkeypatch, tmp_pat
     with patch("sys.argv", argv):
         main()
 
-    assert sorted(p.name for p in log_dir.iterdir()) == ["run-abc.555.0.ndjson"]
+    assert sorted(p.name for p in log_dir.glob("*.ndjson")) == ["run-abc.555.0.ndjson"]
     events = _read_events(log_dir, "run-abc.555.0")
     assert [e["type"] for e in events] == ["job.assigned", "epoch.started", "epoch.completed"]
     assert {e["run_id"] for e in events} == {"run-abc"}

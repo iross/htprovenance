@@ -59,6 +59,7 @@ from htprovenance.autocapture import (
     submit_host_capture_target,
 )
 from htprovenance.events import emit_event
+from htprovenance.packages import is_list_file
 from htprovenance.post import parse_classad, schedd_from_global_job_id
 from htprovenance.sidecar import sha256_file
 
@@ -265,7 +266,7 @@ def output_entries(
     """Return the entries for a files.outputs event.
 
     The job's own NDJSON file is left out: it is still being appended to.
-    Files in `previous` (an earlier files.outputs event's entries) whose size
+    So is its package list file, which is provenance, not a result. Files in `previous` (an earlier files.outputs event's entries) whose size
     and mtime have not changed keep their hash without being read again.
     """
     if paths:
@@ -281,7 +282,7 @@ def output_entries(
     known = {entry["path"]: entry for entry in previous or []}
     entries = []
     for path in candidates:
-        if path.resolve() == own_log:
+        if path.resolve() == own_log or is_list_file(path):
             continue
         destination = _destination_url(path, ad, remaps)
         extra = {"destination_url": destination} if destination else {}
