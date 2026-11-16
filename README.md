@@ -162,10 +162,11 @@ PYTHONPATH=htprovenance-<version>-py3-none-any.whl python3 -m htprovenance.fileh
 ```
 
 Hashing reads every byte of every file, so it adds time in proportion to
-the data. One measurement, on a CHTC execute node (e4046, submitted from
-ap2002, 2026-11-16): a 2 GB file took 5.1 s, about 400 MB/s. The file had
-just been written in the job's sandbox, so it was probably served from
-memory; a large input read from disk for the first time may hash slower.
+the data. Two measurements on CHTC execute nodes (submitted from ap2002,
+2026-11-16), each hashing a 2 GB file: 5.1 s on e4046 (about 400 MB/s) and
+8.0 s on e2485 (about 256 MB/s). The file had just been written in the
+job's sandbox, so it was probably served from memory; a large input read
+from disk for the first time may hash slower.
 
 `db build` files the hashes in the `file_edges` table, keyed by
 `(schedd, cluster_id, proc_id, role, path)`. Files are matched by hash, so
