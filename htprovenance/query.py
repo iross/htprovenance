@@ -8,6 +8,9 @@ CLI:
     htprovenance-query lineage <checkpoint>   -- print ancestry chain
     htprovenance-query events <run_id>        -- print all events for a run
     htprovenance-query db build               -- build/refresh the SQLite database
+    htprovenance-query files software <file>  -- what software produced a file
+    htprovenance-query files downstream <file> -- what was made from a file
+    htprovenance-query files chain <a> <b>    -- the jobs leading from a to b
 
 Both `lineage` and `events` accept --json for machine-readable output and
 --log-dir to override the default NDJSON location. See `htprovenance-query db
@@ -19,6 +22,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
+from contextlib import closing
 from typing import Annotated, Optional
 
 import typer
@@ -33,10 +38,22 @@ from htprovenance.db import (
 from htprovenance.events import _DEFAULT_LOG_DIR
 from htprovenance.event_log_scan import scan_event_log
 from htprovenance.history_enrich import _DEFAULT_BATCH_SIZE
+from htprovenance.lineage import (
+    chain_between,
+    downstream_outputs,
+    resolve_hash,
+    software_for_output,
+)
 
 app = typer.Typer(no_args_is_help=True)
 db_app = typer.Typer(no_args_is_help=True, help="Build/refresh the local SQLite provenance database.")
 app.add_typer(db_app, name="db")
+files_app = typer.Typer(
+    no_args_is_help=True,
+    help="File lineage from in-job hashes (htprovenance-hash). FILE arguments are a "
+    "SHA-256, a local file, or a file name / URL recorded in the database.",
+)
+app.add_typer(files_app, name="files")
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +427,124 @@ def db_enrich_jobad(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"Wrote {written} row(s) to {db} (condor_history, source=jobad)")
+
+
+_DbOption = Annotated[str, typer.Option(help="Path to the SQLite database file")]
+_JsonOption = Annotated[bool, typer.Option("--json", help="Emit JSON")]
+
+
+def _open_lineage_db(db: str) -> sqlite3.Connection:
+    """Open db for lineage queries, exiting with an error if it has no file hashes."""
+    if not Path(db).is_file():
+        typer.echo(f"Error: {db} does not exist; run `htprovenance-query db build` first", err=True)
+        raise typer.Exit(1)
+    conn = sqlite3.connect(db)
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_edges'"
+    ).fetchone()
+    if not has_table:
+        conn.close()
+        typer.echo(
+            f"Error: {db} has no file_edges table; rerun `htprovenance-query db build "
+            "--full-rescan` with this version",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return conn
+
+
+def _resolve_or_exit(conn: sqlite3.Connection, file_or_hash: str) -> str:
+    try:
+        return resolve_hash(conn, file_or_hash)
+    except LookupError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+def _format_file(entry: dict | None) -> str:
+    if entry is None:
+        return "not recorded"
+    sha256 = entry.get("sha256")
+    text = f"{entry['path']}  {'sha256:' + sha256 if sha256 else '(' + entry['status'] + ')'}"
+    if entry.get("destination_url"):
+        text += f"  -> {entry['destination_url']}"
+    return text
+
+
+@files_app.command("software")
+def files_software(
+    file: Annotated[str, typer.Argument(help="Output file: hash, local file, or recorded name")],
+    db: _DbOption = DEFAULT_DB_PATH,
+    json_out: _JsonOption = False,
+) -> None:
+    """Show the job, executable, container and environment that produced a file."""
+    with closing(_open_lineage_db(db)) as conn:
+        sha256 = _resolve_or_exit(conn, file)
+        records = software_for_output(conn, sha256)
+    if json_out:
+        typer.echo(json.dumps({"sha256": sha256, "produced_by": records}, indent=2))
+        return
+    typer.echo(f"sha256:{sha256} was written by {len(records)} job(s)")
+    for record in records:
+        typer.echo(f"  {record['job']}  run_id={record['run_id']}")
+        for output in record["outputs"]:
+            typer.echo(f"    output       {_format_file(output)}")
+        typer.echo(f"    executable   {_format_file(record['executable'])}")
+        typer.echo(f"    container    {_format_file(record['container'])}")
+        environment = "  ".join(f"{k}={v}" for k, v in record["environment"].items())
+        typer.echo(f"    environment  {environment or 'not recorded'}")
+
+
+@files_app.command("downstream")
+def files_downstream(
+    file: Annotated[str, typer.Argument(help="Input file: hash, local file, or recorded name")],
+    db: _DbOption = DEFAULT_DB_PATH,
+    json_out: _JsonOption = False,
+) -> None:
+    """Show the outputs of every job that read a file."""
+    with closing(_open_lineage_db(db)) as conn:
+        sha256 = _resolve_or_exit(conn, file)
+        records = downstream_outputs(conn, sha256)
+    if json_out:
+        typer.echo(json.dumps({"sha256": sha256, "read_by": records}, indent=2))
+        return
+    typer.echo(f"sha256:{sha256} was read by {len(records)} job(s)")
+    for record in records:
+        roles = ", ".join(f"{read['role']} {read['path']}" for read in record["read_as"])
+        typer.echo(f"  {record['job']}  run_id={record['run_id']}  (as {roles})")
+        for output in record["outputs"]:
+            typer.echo(f"    output  {_format_file(output)}")
+        if not record["outputs"]:
+            typer.echo("    no outputs recorded")
+
+
+@files_app.command("chain")
+def files_chain(
+    start: Annotated[str, typer.Argument(help="Earlier file: hash, local file, or recorded name")],
+    end: Annotated[str, typer.Argument(help="Later file: hash, local file, or recorded name")],
+    db: _DbOption = DEFAULT_DB_PATH,
+    json_out: _JsonOption = False,
+) -> None:
+    """Show the series of jobs that leads from one file to another."""
+    with closing(_open_lineage_db(db)) as conn:
+        start_sha256 = _resolve_or_exit(conn, start)
+        end_sha256 = _resolve_or_exit(conn, end)
+        steps = chain_between(conn, start_sha256, end_sha256)
+    if json_out:
+        typer.echo(json.dumps({"start": start_sha256, "end": end_sha256, "steps": steps}, indent=2))
+    if steps is None:
+        typer.echo(f"No recorded jobs connect sha256:{start_sha256} to sha256:{end_sha256}", err=True)
+        raise typer.Exit(1)
+    if json_out:
+        return
+    if not steps:
+        typer.echo("Both names refer to the same file contents")
+        return
+    typer.echo(f"{len(steps)} job(s) from sha256:{start_sha256} to sha256:{end_sha256}")
+    for number, step in enumerate(steps, start=1):
+        typer.echo(f"  {number}. {step['job']}  run_id={step['run_id']}")
+        typer.echo(f"       read   {_format_file(step['input'])}")
+        typer.echo(f"       wrote  {_format_file(step['output'])}")
 
 
 def main() -> None:

@@ -20,6 +20,7 @@ htprovenance-post        = "htprovenance.post:main"
 htprovenance-log-monitor = "htprovenance.log_monitor:main"
 htprovenance-query       = "htprovenance.query:main"
 htprovenance-repair      = "htprovenance.repair:main"
+htprovenance-hash        = "htprovenance.filehash:main"
 
 [project.urls]
 Homepage = "https://github.com/iross/htprovenance"

@@ -1,10 +1,10 @@
 ---
 id: TASK-2
 title: In-job file hashing and lineage queries
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-04 22:06'
+updated_date: '2026-11-16 15:54'
 labels: []
 dependencies:
   - TASK-1
@@ -50,14 +50,37 @@ Query commands, by file path or hash:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 htprovenance-hash inputs/outputs emits files.* events with sha256, size, role and path into the job's per-proc NDJSON
-- [ ] #2 With no paths given, file lists come from the job ad's TransferInput/TransferOutput; executable and container edges are recorded
-- [ ] #3 Remapped outputs record their destination URL alongside the hash
-- [ ] #4 The command never changes the job's exit code; missing/unreadable files are recorded and reported on stderr
-- [ ] #5 Decision on jobs without htprovenance installed is made and recorded in this task
-- [ ] #6 db build ingests files.* events into file_edges keyed by (schedd, cluster_id, proc_id, role, path); re-ingest is idempotent
-- [ ] #7 Query commands answer: software for an output, outputs downstream of an input, job chain between two files
-- [ ] #8 Tests cover: missing and unreadable files, empty transfer lists, queue N procs, remapped outputs, same cluster_id on two schedds, chains of 3+ jobs
+- [x] #1 htprovenance-hash inputs/outputs emits files.* events with sha256, size, role and path into the job's per-proc NDJSON
+- [x] #2 With no paths given, file lists come from the job ad's TransferInput/TransferOutput; executable and container edges are recorded
+- [x] #3 Remapped outputs record their destination URL alongside the hash
+- [x] #4 The command never changes the job's exit code; missing/unreadable files are recorded and reported on stderr
+- [x] #5 Decision on jobs without htprovenance installed is made and recorded in this task
+- [x] #6 db build ingests files.* events into file_edges keyed by (schedd, cluster_id, proc_id, role, path); re-ingest is idempotent
+- [x] #7 Query commands answer: software for an output, outputs downstream of an input, job chain between two files
+- [x] #8 Tests cover: missing and unreadable files, empty transfer lists, queue N procs, remapped outputs, same cluster_id on two schedds, chains of 3+ jobs
 - [ ] #9 Hashing time measured on ap2001/ap2002 for a multi-GB staged input and documented in the README
-- [ ] #10 README documents the two lines a job script adds and the three queries
+- [x] #10 README documents the two lines a job script adds and the three queries
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented 2026-11-16 on branch feat/file-hash-lineage.
+
+- htprovenance/filehash.py: `htprovenance-hash inputs|outputs [PATH...]` emits files.inputs / files.outputs into the job's per-job NDJSON with schedd, cluster_id, proc_id. Entries carry path, role, sha256, size, mtime_ns, status (ok / missing / unreadable / reference / unresolved), source (the TransferInput entry or Cmd) and destination_url.
+- htprovenance/db.py: file_edges table keyed by (schedd, cluster_id, proc_id, role, path); db build upserts it from every files.* event it reads, including on --full-rescan.
+- htprovenance/lineage.py + `htprovenance-query files software|downstream|chain`.
+
+Decision for AC #5 (jobs without htprovenance installed): no separate script. filehash and what it imports use only the standard library (post.py now imports yaml inside load_classad_field_mapping), so a job transfers the wheel and runs `PYTHONPATH=<wheel> python3 -m htprovenance.filehash inputs`. Needs Python 3.9+ in the job; jobs with no Python are not covered. Checked locally with /usr/bin/python3 3.9.6 (no yaml/typer) against a built wheel: three chained jobs, one input renamed between jobs, `files chain` returned all three steps.
+
+Choices made where the task left room:
+- PATH arguments replace the job ad's TransferInput / TransferOutput list (they do not add to it); executable and container are still recorded on inputs.
+- With transfer_output_files unset, outputs are the top-level files that are new or whose size/mtime differ from what the inputs call recorded, minus dotfiles and _condor_stdout/_condor_stderr.
+- output_destination is recorded as destination_url for outputs without a remap.
+- A TransferInput entry ending in '/' (directory contents) is recorded as status 'unresolved' with a stderr note.
+- A container is hashed only when the image is a readable file (sandbox basename or the path as given); otherwise status 'reference' with no hash.
+- `files downstream` is one hop (readers and their outputs); `files chain` is the multi-hop search. A name recorded with more than one hash is an error listing the hashes.
+- A job that runs again replaces its earlier file_edges rows.
+
+Open: AC #9 (hashing time for a multi-GB staged input on ap2001/ap2002) not measured, and nothing here has run inside a real HTCondor job yet: sandbox names for the executable and URL inputs, and TransferOutputRemaps / OutputDestination formats, are from the job-ad attribute definitions and unit tests only.
+<!-- SECTION:NOTES:END -->

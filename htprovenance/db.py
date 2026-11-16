@@ -91,6 +91,30 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_run_type ON events(run_id, type);
 CREATE INDEX IF NOT EXISTS idx_events_run_epoch ON events(run_id, epoch);
 
+-- One row per file a job read or wrote, from files.inputs / files.outputs
+-- events (htprovenance.filehash, called inside the job). role is input,
+-- executable, container or output. sha256 is NULL when the file was missing
+-- or unreadable (see status) and for a container recorded by reference
+-- only. Joining an output row's sha256 to another job's input row is what
+-- links jobs into a lineage (htprovenance.lineage). A job that runs again
+-- (retry, eviction) replaces its earlier rows.
+CREATE TABLE IF NOT EXISTS file_edges (
+    schedd          TEXT NOT NULL,
+    cluster_id      INTEGER NOT NULL,
+    proc_id         INTEGER NOT NULL,
+    role            TEXT NOT NULL,
+    path            TEXT NOT NULL,
+    sha256          TEXT,
+    size            INTEGER,
+    status          TEXT NOT NULL,
+    source          TEXT,
+    destination_url TEXT,
+    run_id          TEXT NOT NULL,
+    ts              TEXT NOT NULL,
+    PRIMARY KEY (schedd, cluster_id, proc_id, role, path)
+);
+CREATE INDEX IF NOT EXISTS idx_file_edges_sha256 ON file_edges(sha256);
+
 CREATE TABLE IF NOT EXISTS event_file_state (
     source_file TEXT PRIMARY KEY,
     byte_offset INTEGER NOT NULL,
@@ -297,6 +321,41 @@ def _ingest_checkpoint_sidecar(
     stats.checkpoints_ingested += 1
 
 
+_FILE_EVENT_TYPES = frozenset({"files.inputs", "files.outputs"})
+
+
+def _ingest_file_edges(conn: sqlite3.Connection, event: dict, *, where: str) -> None:
+    """Upsert a files.inputs / files.outputs event's entries into file_edges.
+
+    Runs for every such event read, including ones already in the events
+    table, so a --full-rescan refills file_edges without duplicating rows.
+    """
+    job = (event.get("schedd"), event.get("cluster_id"), event.get("proc_id"))
+    if any(part is None for part in job):
+        logger.warning(
+            "%s: %s event has no schedd/cluster_id/proc_id, its files are not indexed",
+            where, event["type"],
+        )
+        return
+    for entry in event.get("files") or []:
+        if not entry.get("path") or not entry.get("role"):
+            logger.warning("%s: file entry without path or role, skipping", where)
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO file_edges
+                (schedd, cluster_id, proc_id, role, path, sha256, size, status,
+                 source, destination_url, run_id, ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                *job, entry["role"], entry["path"], entry.get("sha256"),
+                entry.get("size"), entry.get("status", "ok"), entry.get("source"),
+                entry.get("destination_url"), event["run_id"], event["ts"],
+            ),
+        )
+
+
 def _ingest_event_file(
     conn: sqlite3.Connection,
     ndjson_path: Path,
@@ -373,6 +432,8 @@ def _ingest_event_file(
         )
         if cursor.rowcount:
             stats.events_ingested += 1
+        if event_type in _FILE_EVENT_TYPES:
+            _ingest_file_edges(conn, event, where=f"{ndjson_path} line {line_no}")
 
     conn.execute(
         """

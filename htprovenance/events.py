@@ -41,6 +41,8 @@ VALID_EVENT_TYPES: frozenset[str] = frozenset({
     "job.resource_usage",
     "dagman.started",
     "service.started",
+    "files.inputs",
+    "files.outputs",
 })
 
 _DEFAULT_LOG_DIR = "output/provenance"
