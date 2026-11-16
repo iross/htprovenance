@@ -88,8 +88,28 @@ mldag's jobs (which set `PROVENANCE_RUN_ID`) write their per-job file under
 
 HTCondor records the names of the files a job transfers, not their contents,
 so a reused or overwritten name can't say which bytes a job read or wrote.
-The job's sandbox is the one place that sees the bytes, so the job's script
-records them itself, with two added lines:
+The job's sandbox is the one place that sees the bytes, so they are hashed
+there.
+
+**Python jobs with htprovenance installed need no changes.** The same
+startup hook that records `job.assigned` hashes the job's inputs when its
+first Python process starts, and its outputs each time one of its Python
+processes exits. It prints nothing. Things to know:
+
+- Hashing inputs delays the first Python process by the time it takes to
+  read them (see the measurement below).
+- Outputs are recorded as they stand when a Python process exits. A file
+  the job script creates after its last Python process (`tar czf out.tgz
+  results/`) is not hashed; add `htprovenance-hash outputs` as the script's
+  last line for those.
+- A file that existed when a Python process exited is recorded as an output
+  even if the script deletes it afterwards.
+- Nothing is recorded at exit for a process that is killed by a signal or
+  calls `os._exit`.
+- A file whose size and modification time are unchanged since the last
+  recording is not read again.
+
+Any other job records them from its script, with two added lines:
 
 ```bash
 #!/bin/bash

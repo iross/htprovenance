@@ -371,3 +371,165 @@ def test_runs_without_third_party_packages(sandbox, tmp_path):
 
     assert "recorded 1 of 1 inputs file(s)" in result.stdout
     assert (tmp_path / "cluster-100.100.0.ndjson").exists()
+
+
+# --- automatic recording from the interpreter-startup hook ---
+
+LOG = "cluster-100.100.0.ndjson"
+
+
+@pytest.fixture
+def auto(sandbox, tmp_path, monkeypatch):
+    """The sandbox fixture, with $_CONDOR_SCRATCH_DIR set and no exit hook left behind."""
+    monkeypatch.setenv("_CONDOR_SCRATCH_DIR", str(tmp_path))
+    yield sandbox
+    import atexit
+
+    atexit.unregister(filehash._record_outputs_at_exit)
+
+
+def _files_events(tmp_path: Path, event_type: str) -> list[dict]:
+    log = tmp_path / LOG
+    if not log.exists():
+        return []
+    return [event for event in _events(log) if event["type"] == event_type]
+
+
+def test_automatic_recording_hashes_inputs_once_per_job(auto, tmp_path):
+    auto(TransferInput="/home/u/in.txt")
+    (tmp_path / "in.txt").write_bytes(b"in")
+
+    filehash.start_automatic_recording()
+    filehash.start_automatic_recording()  # the job's second Python process
+
+    (event,) = _files_events(tmp_path, "files.inputs")
+    assert event["files"][0]["sha256"] == _sha256(b"in")
+    assert event["cluster_id"] == 100
+    assert event["schedd"] == SCHEDD
+
+
+def test_automatic_recording_prints_nothing_about_missing_files(auto, tmp_path, capsys):
+    auto(TransferInput="gone.txt", TransferOutput="never_written.txt")
+
+    filehash.start_automatic_recording()
+    filehash._record_outputs_at_exit()
+
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "")
+    assert _files_events(tmp_path, "files.inputs")[0]["files"][0]["status"] == "missing"
+    assert _files_events(tmp_path, "files.outputs")[0]["files"][0]["status"] == "missing"
+
+
+def test_exit_hook_records_default_transfer_outputs(auto, tmp_path):
+    auto(TransferInput="in.txt")
+    (tmp_path / "in.txt").write_bytes(b"in")
+    filehash.start_automatic_recording()
+    (tmp_path / "result.csv").write_bytes(b"result")
+
+    filehash._record_outputs_at_exit()
+
+    (event,) = _files_events(tmp_path, "files.outputs")
+    assert [(f["path"], f["sha256"]) for f in event["files"]] == [
+        ("result.csv", _sha256(b"result"))
+    ]
+
+
+def test_exit_hook_writes_no_event_when_nothing_changed(auto, tmp_path):
+    auto()
+    filehash.start_automatic_recording()
+
+    filehash._record_outputs_at_exit()  # no outputs yet
+    (tmp_path / "result.csv").write_bytes(b"result")
+    filehash._record_outputs_at_exit()
+    filehash._record_outputs_at_exit()
+
+    assert len(_files_events(tmp_path, "files.outputs")) == 1
+
+
+def test_exit_hook_rehashes_only_files_that_changed(auto, tmp_path, monkeypatch):
+    auto()
+    (tmp_path / "big.bin").write_bytes(b"big")
+    (tmp_path / "log.txt").write_bytes(b"one")
+    filehash._record_outputs_at_exit()
+    (tmp_path / "log.txt").write_bytes(b"one, two")
+    hashed = []
+    real_sha256_file = filehash.sha256_file
+
+    def counting_sha256_file(path):
+        hashed.append(str(path))
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(filehash, "sha256_file", counting_sha256_file)
+
+    filehash._record_outputs_at_exit()
+
+    assert hashed == ["log.txt"]
+    latest = _by_path(_files_events(tmp_path, "files.outputs")[-1]["files"])
+    assert latest["log.txt"]["sha256"] == _sha256(b"one, two")
+    assert latest["big.bin"]["sha256"] == _sha256(b"big")
+
+
+def test_exit_hook_finds_the_sandbox_after_the_job_changed_directory(
+    auto, tmp_path, monkeypatch
+):
+    auto(TransferOutput="result.csv")
+    (tmp_path / "result.csv").write_bytes(b"result")
+    elsewhere = tmp_path / "work"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    filehash._record_outputs_at_exit()
+
+    (event,) = _files_events(tmp_path, "files.outputs")
+    assert event["files"][0]["status"] == "ok"
+    assert Path.cwd() == elsewhere
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_automatic_recording_does_nothing_for_dagman_on_the_access_point(auto, tmp_path):
+    auto(JobUniverse=7, TransferInput="in.txt")
+    (tmp_path / "in.txt").write_bytes(b"in")
+
+    filehash.start_automatic_recording()
+
+    assert not (tmp_path / LOG).exists()
+
+
+def test_automatic_recording_never_raises(auto, tmp_path, monkeypatch):
+    monkeypatch.setenv("_CONDOR_JOB_AD", str(tmp_path / "no_such_ad"))
+
+    filehash.start_automatic_recording()
+    filehash._record_outputs_at_exit()
+
+    monkeypatch.delenv("_CONDOR_JOB_AD")
+    filehash.start_automatic_recording()
+    filehash._record_outputs_at_exit()
+
+
+def test_python_process_in_a_job_records_inputs_and_outputs_unasked(auto, tmp_path):
+    """The startup hook plus a real interpreter exit, with the job changing directory."""
+    auto(TransferInput="in.txt")
+    (tmp_path / "in.txt").write_bytes(b"in")
+    job_code = (
+        "import os, htprovenance._autorun\n"
+        "open('result.csv', 'w').write('result')\n"
+        "os.mkdir('work'); os.chdir('work')\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(filehash.__file__).parent.parent),
+    }
+    env.pop("HTPROVENANCE_NO_AUTORUN", None)
+
+    result = subprocess.run(
+        [sys.executable, "-c", job_code],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
+    )
+
+    assert (result.stdout, result.stderr) == ("", "")
+    (inputs,) = _files_events(tmp_path, "files.inputs")
+    assert inputs["files"][0]["sha256"] == _sha256(b"in")
+    (outputs,) = _files_events(tmp_path, "files.outputs")
+    assert [(f["path"], f["sha256"]) for f in outputs["files"]] == [
+        ("result.csv", _sha256(b"result"))
+    ]

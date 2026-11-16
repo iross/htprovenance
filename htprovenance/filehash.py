@@ -26,6 +26,12 @@ transfer the wheel and run it in place:
     PYTHONPATH=htprovenance-<version>-py3-none-any.whl \\
         python3 -m htprovenance.filehash inputs
 
+Where htprovenance is installed in the job's Python environment, neither
+call is needed: the interpreter-startup hook (htprovenance/_autorun.py)
+calls start_automatic_recording(), which hashes inputs when the job's first
+Python process starts and outputs whenever one of its Python processes
+exits. Automatic recording writes nothing to the job's stdout or stderr.
+
 Best-effort like autocapture: main() never raises and always exits 0.
 Missing or unreadable files are recorded with a status and reported on
 stderr.
@@ -34,9 +40,12 @@ stderr.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -45,6 +54,7 @@ from htprovenance.autocapture import (
     execute_node_log_dir,
     execute_node_ndjson_stem,
     execute_node_run_id,
+    submit_host_capture_target,
 )
 from htprovenance.events import emit_event
 from htprovenance.post import parse_classad, schedd_from_global_job_id
@@ -52,6 +62,7 @@ from htprovenance.sidecar import sha256_file
 
 _CONTAINER_IMAGE_AD_KEYS = ("ContainerImage", "SingularityImage", "DockerImage")
 _CONDOR_SANDBOX_FILES = frozenset({"_condor_stdout", "_condor_stderr"})
+_INPUTS_MARKER_FILENAME = ".htprovenance_inputs_hashed"
 
 
 def _warn(message: str) -> None:
@@ -61,8 +72,7 @@ def _warn(message: str) -> None:
 def hash_file(path: Path, role: str, **extra: str) -> dict:
     """Return one file entry: path, role, and sha256/size/mtime_ns when readable.
 
-    status is "ok", "missing" or "unreadable"; the latter two carry no hash
-    and are reported on stderr.
+    status is "ok", "missing" or "unreadable"; the latter two carry no hash.
     """
     entry: dict = {"path": str(path), "role": role, **extra}
     try:
@@ -75,11 +85,21 @@ def hash_file(path: Path, role: str, **extra: str) -> dict:
         )
     except FileNotFoundError:
         entry["status"] = "missing"
-        _warn(f"{role} file {path} does not exist")
     except OSError as exc:
         entry.update(status="unreadable", error=str(exc))
-        _warn(f"cannot read {role} file {path}: {exc}")
     return entry
+
+
+def _report_problems(entries: list[dict]) -> None:
+    """Print one stderr line for each file that could not be hashed."""
+    for entry in entries:
+        status, role, path = entry.get("status"), entry["role"], entry["path"]
+        if status == "missing":
+            _warn(f"{role} file {path} does not exist")
+        elif status == "unreadable":
+            _warn(f"cannot read {role} file {path}: {entry.get('error')}")
+        elif status == "unresolved":
+            _warn(f"cannot tell which sandbox files came from {path!r}; pass them as paths")
 
 
 def _expand(path: Path) -> list[Path]:
@@ -115,7 +135,6 @@ def _transfer_input_entries(ad: dict) -> list[dict]:
     for source in _split_list(ad.get("TransferInput")):
         path = sandbox_path(source)
         if path is None:
-            _warn(f"cannot tell which sandbox files came from {source!r}; pass them as paths")
             entries.append({"path": source, "role": "input", "status": "unresolved"})
             continue
         entries.extend(hash_file(p, "input", source=source) for p in _expand(path))
@@ -163,26 +182,25 @@ def input_entries(ad: dict, paths: list[str]) -> list[dict]:
     return entries
 
 
-def _recorded_inputs(log_path: Path) -> dict[str, tuple[int, int]]:
-    """Return {path: (size, mtime_ns)} from this job's latest files.inputs event."""
-    recorded: dict[str, tuple[int, int]] = {}
+def _latest_files(log_path: Path, event_type: str) -> list[dict]:
+    """Return the file entries of this job's latest event of event_type, [] if none."""
+    files: list[dict] = []
     try:
         lines = log_path.read_text().splitlines()
     except OSError:
-        return recorded
+        return files
     for line in lines:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") != "files.inputs":
-            continue
-        recorded = {
-            f["path"]: (f["size"], f["mtime_ns"])
-            for f in event.get("files", [])
-            if f.get("status") == "ok"
-        }
-    return recorded
+        if event.get("type") == event_type:
+            files = event.get("files", [])
+    return files
+
+
+def _size_and_mtime(entries: list[dict]) -> dict[str, tuple[int, int]]:
+    return {e["path"]: (e["size"], e["mtime_ns"]) for e in entries if e.get("status") == "ok"}
 
 
 def _default_output_paths(log_path: Path) -> list[Path]:
@@ -192,7 +210,7 @@ def _default_output_paths(log_path: Path) -> list[Path]:
     the inputs call with the same size and mtime are unchanged; HTCondor's
     own stdout/stderr files and dotfiles are not the job's outputs.
     """
-    unchanged = _recorded_inputs(log_path)
+    unchanged = _size_and_mtime(_latest_files(log_path, "files.inputs"))
     paths = []
     for path in sorted(Path().iterdir()):
         if not path.is_file() or path.name.startswith("."):
@@ -225,10 +243,28 @@ def _destination_url(path: Path, ad: dict, remaps: dict[str, str]) -> str | None
     return None
 
 
-def output_entries(ad: dict, paths: list[str], log_path: Path) -> list[dict]:
+def _hash_unless_unchanged(path: Path, previous: dict[str, dict], **extra: str) -> dict:
+    """Return path's output entry, reusing the previous hash if size and mtime match."""
+    old = previous.get(str(path))
+    if old is not None and old.get("status") == "ok":
+        try:
+            stat = path.stat()
+        except OSError:
+            return hash_file(path, "output", **extra)
+        if (old["size"], old["mtime_ns"]) == (stat.st_size, stat.st_mtime_ns):
+            kept = {key: old[key] for key in ("sha256", "size", "mtime_ns", "status")}
+            return {"path": str(path), "role": "output", **extra, **kept}
+    return hash_file(path, "output", **extra)
+
+
+def output_entries(
+    ad: dict, paths: list[str], log_path: Path, previous: list[dict] | None = None
+) -> list[dict]:
     """Return the entries for a files.outputs event.
 
     The job's own NDJSON file is left out: it is still being appended to.
+    Files in `previous` (an earlier files.outputs event's entries) whose size
+    and mtime have not changed keep their hash without being read again.
     """
     if paths:
         candidates = [p for raw in paths for p in _expand(Path(raw))]
@@ -240,35 +276,25 @@ def output_entries(ad: dict, paths: list[str], log_path: Path) -> list[dict]:
 
     remaps = _output_remaps(ad)
     own_log = log_path.resolve()
+    known = {entry["path"]: entry for entry in previous or []}
     entries = []
     for path in candidates:
         if path.resolve() == own_log:
             continue
         destination = _destination_url(path, ad, remaps)
         extra = {"destination_url": destination} if destination else {}
-        entries.append(hash_file(path, "output", **extra))
+        entries.append(_hash_unless_unchanged(path, known, **extra))
     return entries
 
 
-def record(kind: str, paths: list[str]) -> list[dict]:
-    """Hash this job's inputs or outputs and append a files.<kind> event.
-
-    Returns the file entries written to the event.
-
-    Raises:
-        RuntimeError: outside an HTCondor job ($_CONDOR_JOB_AD is not set),
-            where there is no job to file the hashes under.
-    """
+def _job_ad() -> dict:
     job_ad_path = os.environ.get("_CONDOR_JOB_AD")
     if not job_ad_path:
         raise RuntimeError("$_CONDOR_JOB_AD is not set; not inside an HTCondor job")
-    ad = parse_classad(job_ad_path)
-    log_path = execute_node_event_log_path(ad)
-    if kind == "inputs":
-        entries = input_entries(ad, paths)
-    else:
-        entries = output_entries(ad, paths, log_path)
+    return parse_classad(job_ad_path)
 
+
+def _emit(kind: str, ad: dict, entries: list[dict]) -> None:
     run_id = execute_node_run_id(ad)
     emit_event(
         f"files.{kind}",
@@ -281,7 +307,98 @@ def record(kind: str, paths: list[str]) -> list[dict]:
         schedd=schedd_from_global_job_id(str(ad.get("GlobalJobId", ""))),
         files=entries,
     )
+
+
+def record(kind: str, paths: list[str], *, quiet: bool = False) -> list[dict]:
+    """Hash this job's inputs or outputs and append a files.<kind> event.
+
+    Files that could not be hashed are reported on stderr unless quiet.
+    Returns the file entries written to the event.
+
+    Raises:
+        RuntimeError: outside an HTCondor job ($_CONDOR_JOB_AD is not set),
+            where there is no job to file the hashes under.
+    """
+    ad = _job_ad()
+    if kind == "inputs":
+        entries = input_entries(ad, paths)
+    else:
+        entries = output_entries(ad, paths, execute_node_event_log_path(ad))
+    _emit(kind, ad, entries)
+    if not quiet:
+        _report_problems(entries)
     return entries
+
+
+@contextmanager
+def _in_sandbox() -> Generator[None, None, None]:
+    """Run the block with the job's sandbox as the working directory.
+
+    The job ad's file names are relative to the sandbox, and the job's own
+    code may have changed directory by the time its Python process exits.
+    """
+    scratch_dir = os.environ.get("_CONDOR_SCRATCH_DIR")
+    if not scratch_dir:
+        yield
+        return
+    original = Path.cwd()
+    os.chdir(scratch_dir)
+    try:
+        yield
+    finally:
+        os.chdir(original)
+
+
+def _claim_inputs_marker() -> bool:
+    """Return True for the first caller in this sandbox, False for every later one."""
+    try:
+        Path(_INPUTS_MARKER_FILENAME).open("x").close()
+    except FileExistsError:
+        return False
+    return True
+
+
+def _record_outputs_at_exit() -> None:
+    """Record this job's outputs as they stand when a Python process exits.
+
+    A job can run many Python processes, so this runs many times: files
+    unchanged since the last files.outputs event are not read again, and no
+    event is written when nothing has changed.
+    """
+    try:
+        with _in_sandbox():
+            ad = _job_ad()
+            log_path = execute_node_event_log_path(ad)
+            previous = _latest_files(log_path, "files.outputs")
+            entries = output_entries(ad, [], log_path, previous)
+            if entries != previous:
+                _emit("outputs", ad, entries)
+    except Exception:  # noqa: BLE001, S110 -- deliberately blind and silent:
+        # runs inside the job's own Python process, which must exit exactly
+        # as it would have without htprovenance installed.
+        pass
+
+
+def start_automatic_recording() -> None:
+    """Hash this job's inputs now, and its outputs when this process exits.
+
+    Called at interpreter startup by htprovenance._autorun. Inputs are
+    hashed by the job's first Python process only. Does nothing on the
+    access point (DAGMan, SERVICE nodes), writes nothing to stdout or
+    stderr, and never raises.
+    """
+    try:
+        ad = _job_ad()
+        if submit_host_capture_target(ad) is not None:
+            return
+        with _in_sandbox():
+            if _claim_inputs_marker():
+                record("inputs", [], quiet=True)
+        atexit.register(_record_outputs_at_exit)
+    except Exception:  # noqa: BLE001, S110 -- deliberately blind and silent:
+        # runs at the start of every Python process in the job, before the
+        # job's own code; a failure here must not be visible to it.
+        pass
 
 
 def main() -> None:
