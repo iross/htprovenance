@@ -84,6 +84,113 @@ top-level file came back and `output/provenance/` did not. So:
 mldag's jobs (which set `PROVENANCE_RUN_ID`) write their per-job file under
 `output/provenance/`, which their `transfer_output_files = output` brings back.
 
+## File lineage: hashing inputs and outputs inside the job
+
+HTCondor records the names of the files a job transfers, not their contents,
+so a reused or overwritten name can't say which bytes a job read or wrote.
+The job's sandbox is the one place that sees the bytes, so they are hashed
+there.
+
+**Python jobs with htprovenance installed need no changes.** The same
+startup hook that records `job.assigned` hashes the job's inputs when its
+first Python process starts, and its outputs each time one of its Python
+processes exits. It prints nothing. Things to know:
+
+- Hashing inputs delays the first Python process by the time it takes to
+  read them (see the measurement below).
+- Outputs are recorded as they stand when a Python process exits. A file
+  the job script creates after its last Python process (`tar czf out.tgz
+  results/`) is not hashed; add `htprovenance-hash outputs` as the script's
+  last line for those.
+- A file that existed when a Python process exited is recorded as an output
+  even if the script deletes it afterwards.
+- Nothing is recorded at exit for a process that is killed by a signal or
+  calls `os._exit`.
+- A file whose size and modification time are unchanged since the last
+  recording is not read again.
+
+To turn automatic hashing off for a job, for example one with very large
+inputs, set `HTPROVENANCE_NO_FILE_HASHES` in its submit file. `job.assigned`
+is still recorded, and `htprovenance-hash` still works if the script calls
+it:
+
+```
+environment = "HTPROVENANCE_NO_FILE_HASHES=1"
+```
+
+Any other job records them from its script, with two added lines:
+
+```bash
+#!/bin/bash
+htprovenance-hash inputs      # after inputs have arrived
+
+./analyze --in raw.csv --out result.csv
+
+htprovenance-hash outputs     # last, once outputs are written
+```
+
+Each call appends a `files.inputs` / `files.outputs` event, with a SHA-256,
+size and role per file, to the job's own `<run_id>.<cluster>.<proc>.ndjson`.
+The command always exits 0; a missing or unreadable file is recorded with
+that status and reported on stderr.
+
+With no arguments the file lists come from the job ad:
+
+- `inputs`: every `transfer_input_files` entry under its sandbox name (a URL
+  such as `osdf:///...` is the file it downloaded to; a directory is every
+  file in it), the executable (role `executable`), and the container image
+  (role `container`). An image file in the sandbox or on a readable path is
+  hashed. Any other image is recorded by reference only, e.g.
+  `docker://python:3.12-slim`: a tag can point at different images over
+  time, so a reference does not pin the software.
+- `outputs`: every `transfer_output_files` entry. When the job doesn't set
+  it, every top-level file that is new or changed since the `inputs` call,
+  which is what HTCondor's default output transfer returns. An output with a
+  `transfer_output_remaps` entry or an `output_destination` also records the
+  URL it is sent to.
+
+Paths given on the command line replace the list from the job ad
+(`htprovenance-hash outputs results/ model.pt`); the executable and container
+are still recorded. Use this for files the job fetches or uploads itself.
+
+A job without htprovenance installed can run the same code from the wheel,
+with any Python 3.9 or later and no other packages: add the wheel to
+`transfer_input_files` and call
+
+```bash
+PYTHONPATH=htprovenance-<version>-py3-none-any.whl python3 -m htprovenance.filehash inputs
+```
+
+Hashing reads every byte of every file, so it adds time in proportion to
+the data. One measurement, on a CHTC execute node (e4046, submitted from
+ap2002, 2026-11-16): a 2 GB file took 5.1 s, about 400 MB/s. The file had
+just been written in the job's sandbox, so it was probably served from
+memory; a large input read from disk for the first time may hash slower.
+
+`db build` files the hashes in the `file_edges` table, keyed by
+`(schedd, cluster_id, proc_id, role, path)`. Files are matched by hash, so
+jobs link up wherever one job's output is another's input, whatever the file
+was called in each. Three queries read it; each takes a SHA-256, a local
+file (hashed on the spot), or a name, transfer source or destination URL
+recorded in the database, and each accepts `--db` and `--json`:
+
+```bash
+# Which job wrote this file, with which executable, container and environment
+htprovenance-query files software result.csv
+
+# The outputs of every job that read this file
+htprovenance-query files downstream osdf:///chtc/staging/u/raw.csv
+
+# The series of jobs that leads from one file to another
+htprovenance-query files chain raw.csv report.pdf
+```
+
+A name recorded with more than one content hash is ambiguous; the error
+lists the hashes so you can pass the one you mean. The environment
+(`python`, `cuda`, `code_commit`, `htprovenance_version`) comes from the
+job's `job.assigned` event, so it is only present when htprovenance is
+installed in the job's Python environment.
+
 ## CLI
 
 | Command | Purpose |
@@ -93,6 +200,7 @@ mldag's jobs (which set `PROVENANCE_RUN_ID`) write their per-job file under
 | `htprovenance-log-monitor` | DAGMan `SERVICE` — tails the HTCondor event log |
 | `htprovenance-query` | Build/query the provenance database; lineage lookups |
 | `htprovenance-repair` | Repair/backfill existing provenance data |
+| `htprovenance-hash` | Run inside a job: record SHA-256 hashes of its input or output files |
 
 ## Configuring which ClassAd fields land in provenance
 

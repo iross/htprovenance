@@ -18,8 +18,6 @@ import re
 import sys
 from pathlib import Path
 
-import yaml
-
 from htprovenance.constants import DEFAULT_CLASSAD_FIELDS_FILE
 from htprovenance.events import _DEFAULT_LOG_DIR, emit_event
 
@@ -85,6 +83,11 @@ def load_classad_field_mapping(path: Path | str | None) -> dict[str, str]:
     path = Path(path)
     if not path.exists():
         return dict(_DEFAULT_FIELD_MAPPING)
+
+    # Imported here, not at module level: htprovenance.filehash reaches this
+    # module through parse_classad and must import without third-party
+    # packages when run from a bare wheel inside a job.
+    import yaml
 
     data = yaml.safe_load(path.read_text()) or {}
     raw_fields = data.get("fields", [])

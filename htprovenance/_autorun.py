@@ -9,7 +9,9 @@ machine with htprovenance installed -- not just inside HTCondor jobs -- so it mu
 be near-instant and must never raise for the overwhelming common case (not
 running inside an HTCondor job): htprovenance.autocapture.capture_and_emit
 already no-ops immediately when $_CONDOR_JOB_AD isn't set, before doing any
-real work.
+real work. Inside a job it also starts automatic file hashing
+(htprovenance.filehash.start_automatic_recording), which is imported only
+there.
 
 Not meant to be imported for its own functions -- import
 htprovenance.autocapture directly for that; this module exists only to
@@ -28,6 +30,10 @@ if not os.environ.get("HTPROVENANCE_NO_AUTORUN"):
         from htprovenance.autocapture import capture_and_emit
 
         capture_and_emit()
+        if os.environ.get("_CONDOR_JOB_AD"):
+            from htprovenance.filehash import start_automatic_recording
+
+            start_automatic_recording()
     except Exception:  # noqa: BLE001, S110 -- deliberately blind and silent:
         # Python's site module already catches and logs a traceback for a
         # failing .pth import line without crashing the interpreter, but

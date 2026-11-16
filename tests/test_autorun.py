@@ -51,3 +51,20 @@ def test_autorun_import_never_raises_even_if_capture_blows_up(monkeypatch):
     monkeypatch.setattr("htprovenance.autocapture.capture_and_emit", boom)
 
     _reload_autorun()  # must not raise
+
+
+def test_autorun_starts_file_hashing_only_inside_a_job(monkeypatch):
+    monkeypatch.delenv("HTPROVENANCE_NO_AUTORUN", raising=False)
+    monkeypatch.setattr("htprovenance.autocapture.capture_and_emit", lambda: None)
+    calls = []
+    monkeypatch.setattr(
+        "htprovenance.filehash.start_automatic_recording", lambda: calls.append(1)
+    )
+
+    monkeypatch.delenv("_CONDOR_JOB_AD", raising=False)
+    _reload_autorun()
+    assert calls == []
+
+    monkeypatch.setenv("_CONDOR_JOB_AD", "/var/lib/condor/execute/dir_1/.job.ad")
+    _reload_autorun()
+    assert calls == [1]
