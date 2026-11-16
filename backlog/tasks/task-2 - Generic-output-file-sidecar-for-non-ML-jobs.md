@@ -1,10 +1,10 @@
 ---
 id: TASK-2
 title: In-job file hashing and lineage queries
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-16 18:43'
+updated_date: '2026-11-16 18:47'
 labels: []
 dependencies:
   - TASK-1
@@ -58,7 +58,7 @@ Query commands, by file path or hash:
 - [x] #6 db build ingests files.* events into file_edges keyed by (schedd, cluster_id, proc_id, role, path); re-ingest is idempotent
 - [x] #7 Query commands answer: software for an output, outputs downstream of an input, job chain between two files
 - [x] #8 Tests cover: missing and unreadable files, empty transfer lists, queue N procs, remapped outputs, same cluster_id on two schedds, chains of 3+ jobs
-- [ ] #9 Hashing time measured on ap2001/ap2002 for a multi-GB staged input and documented in the README
+- [x] #9 Hashing time measured on an execute point for a multi-GB file in the job's sandbox and documented in the README
 - [x] #10 README documents the two lines a job script adds and the three queries
 <!-- AC:END -->
 
@@ -89,4 +89,6 @@ Real-job test 2026-11-16 on ap2002 (DAG workflow.dag+8756504, jobs 8756532.0 cle
 AC #9: timing job hashed a 2 GB file in 5.1 s (~400 MB/s) on e4046; documented in README. The file was generated in the sandbox with dd, not transferred from /staging, and was likely in page cache, so this is not literally the 'staged input' measurement the AC names. Left unchecked pending the user's call.
 
 Automatic hashing for Python jobs (2026-11-16, user request: no per-job commands for Python jobs). htprovenance/_autorun.py now calls filehash.start_automatic_recording() when $_CONDOR_JOB_AD is set: the job's first Python process hashes inputs (guarded by a .htprovenance_inputs_hashed marker in the sandbox), and every Python process registers an atexit hook that records outputs. The hook reuses hashes for files whose size/mtime match the previous files.outputs event, writes no event when nothing changed, works from $_CONDOR_SCRATCH_DIR so a job that changed directory is still handled, skips DAGMan/SERVICE processes on the AP, and writes nothing to stdout/stderr. Applies to every job with htprovenance installed, including mldag's; HTPROVENANCE_NO_AUTORUN is the only off switch. Known limits (in README): files created after the last Python process exits are not hashed; files present at a Python exit and deleted later stay recorded; no exit recording on signal kill or os._exit. Unit-tested and run through a real interpreter exit locally; not yet run in a real HTCondor job (the ap-check kit loads the wheel via PYTHONPATH, which does not install the .pth hook).
+
+AC #9 reworded 2026-11-16 at the user's direction: hashing happens on the execute point once the file is in the sandbox, so the AP and the transfer mechanism (staged or not) don't matter. The 2 GB / 5.1 s (~400 MB/s, e4046) measurement satisfies it. Added HTPROVENANCE_NO_FILE_HASHES to turn off automatic hashing per job. Automatic hashing from the startup hook is still untested in a real HTCondor job.
 <!-- SECTION:NOTES:END -->
