@@ -30,7 +30,9 @@ Where htprovenance is installed in the job's Python environment, neither
 call is needed: the interpreter-startup hook (htprovenance/_autorun.py)
 calls start_automatic_recording(), which hashes inputs when the job's first
 Python process starts and outputs whenever one of its Python processes
-exits. Automatic recording writes nothing to the job's stdout or stderr.
+exits. Automatic recording writes nothing to the job's stdout or stderr;
+setting $HTPROVENANCE_NO_FILE_HASHES in the job's environment turns it off
+and leaves the two commands working.
 
 Best-effort like autocapture: main() never raises and always exits 0.
 Missing or unreadable files are recorded with a status and reported on
@@ -384,9 +386,11 @@ def start_automatic_recording() -> None:
 
     Called at interpreter startup by htprovenance._autorun. Inputs are
     hashed by the job's first Python process only. Does nothing on the
-    access point (DAGMan, SERVICE nodes), writes nothing to stdout or
-    stderr, and never raises.
+    access point (DAGMan, SERVICE nodes) or when $HTPROVENANCE_NO_FILE_HASHES
+    is set, writes nothing to stdout or stderr, and never raises.
     """
+    if os.environ.get("HTPROVENANCE_NO_FILE_HASHES"):
+        return
     try:
         ad = _job_ad()
         if submit_host_capture_target(ad) is not None:

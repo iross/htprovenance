@@ -495,6 +495,26 @@ def test_automatic_recording_does_nothing_for_dagman_on_the_access_point(auto, t
     assert not (tmp_path / LOG).exists()
 
 
+def test_no_file_hashes_switch_turns_off_automatic_recording_only(
+    auto, tmp_path, monkeypatch
+):
+    auto(TransferInput="in.txt")
+    (tmp_path / "in.txt").write_bytes(b"in")
+    monkeypatch.setenv("HTPROVENANCE_NO_FILE_HASHES", "1")
+    job_code = "import htprovenance._autorun\nopen('result.csv', 'w').write('result')\n"
+    env = {**os.environ, "PYTHONPATH": str(Path(filehash.__file__).parent.parent)}
+    env.pop("HTPROVENANCE_NO_AUTORUN", None)
+
+    subprocess.run([sys.executable, "-c", job_code], cwd=tmp_path, env=env, check=True)
+
+    recorded = {event["type"] for event in _events(tmp_path / LOG)}
+    assert "job.assigned" in recorded
+    assert not recorded & {"files.inputs", "files.outputs"}
+
+    filehash.record("inputs", [])  # the explicit command still records
+    assert len(_files_events(tmp_path, "files.inputs")) == 1
+
+
 def test_automatic_recording_never_raises(auto, tmp_path, monkeypatch):
     monkeypatch.setenv("_CONDOR_JOB_AD", str(tmp_path / "no_such_ad"))
 

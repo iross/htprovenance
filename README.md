@@ -109,6 +109,15 @@ processes exits. It prints nothing. Things to know:
 - A file whose size and modification time are unchanged since the last
   recording is not read again.
 
+To turn automatic hashing off for a job, for example one with very large
+inputs, set `HTPROVENANCE_NO_FILE_HASHES` in its submit file. `job.assigned`
+is still recorded, and `htprovenance-hash` still works if the script calls
+it:
+
+```
+environment = "HTPROVENANCE_NO_FILE_HASHES=1"
+```
+
 Any other job records them from its script, with two added lines:
 
 ```bash
