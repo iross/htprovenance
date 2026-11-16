@@ -1,10 +1,10 @@
 ---
 id: TASK-1
 title: Default run_id for non-DAG jobs and record the schedd
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-11-04 20:40'
-updated_date: '2026-11-05 19:04'
+updated_date: '2026-11-16 15:06'
 labels: []
 dependencies: []
 ordinal: 1000
@@ -88,4 +88,10 @@ site_info.json removed (user decision, 2026-11-04): it duplicated the job.assign
 Found 2026-11-05 on ap2002 (DAG 5a39c146, jobs 7811506/7814509/7817438/7825040, which ran rc2): with transfer_output_files = output, each job's sandbox output/provenance/<run_id>.ndjson replaced the shared file on return, wiping earlier jobs' events (incl. epochs) and the access point's PRE/log_monitor events. Pre-existing on main. Fixed in 9f201cc: every execute-node job (DAG or not) writes <run_id>.<cluster>.<proc>.ndjson; watcher epoch events go to the same file; query_run reads run + per-job files. repair.py keys job_name -> run_id by file stem, but execute-side events carry no job_name, so it is unaffected. Needs re-test on a real DAG with the branch installed in-job and on the AP.
 
 2026-11-05: enrich-history/enrich-jobad now refuse a missing or empty --db (9204e58; the 0-row output on ap2002 was a db build into prov.d followed by enrich on an empty prov.db). enrich-history evaluates ClassAd expressions such as MemoryUsage before storing them (1b7a2fe; previously sqlite3 'type ExprTree is not supported'). Both confirmed working by the user on ap2002 against the 5a39c146 run. Branch pushed to origin. Remaining before Done: re-test a DAG with the branch installed in-job, confirming that per-job NDJSON files survive and that db build / events merge them.
+
+Re-test 2026-11-15 on ap2001, DAG 12468052 (batch htprovenance-task1-retest2; node jobs 12468053.0, 12468054.0, 12468054.1, 12468055.0; an earlier 3-node run was 12468048). Each node ran in docker://python:3.12-slim, installed commit 1ef68f0 from the GitHub archive into a venv, started two interpreters, and returned transfer_output_files = output with PROVENANCE_RUN_ID=retest2-1ef68f0. Result: output/provenance/ on the access point held all four <run_id>.<cluster>.<proc>.ndjson files (both procs of the queue-2 node) plus <run_id>.ndjson with all three PRE events; each per-job file had exactly one job.assigned. Locally, db build ingested 7 events, events <run_id> merged them in time order, and enrich-jobad + scan --db merged into 4 condor_history rows keyed by (ap2001.chtc.wisc.edu, cluster, proc) with source 'event_log,jobad'.
+
+Not covered by this re-test: the access point's <run_id>.ndjson was written by a shell stand-in for htprovenance-pre (htprovenance is not installed in the MCP spool), so log_monitor and the real PRE/POST were not run; the watcher's epoch.* events were not exercised; enrich-history was not re-run.
+
+Also fixed in 1ef68f0: python -m htprovenance.autocapture ran main() before _capture_execute_node/_capture_submit_host were defined, so it printed {} and wrote nothing (pre-existing on main).
 <!-- SECTION:NOTES:END -->
