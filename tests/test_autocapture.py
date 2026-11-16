@@ -401,6 +401,8 @@ def test_capture_and_emit_passes_through_fields_file(monkeypatch, tmp_path):
         "cuda": "unknown",
         "code_commit": "node01",
         "htprovenance_version": payload["htprovenance_version"],
+        "package_set_hash": payload["package_set_hash"],
+        "package_count": payload["package_count"],
         "request_cpus": 4,
         "cluster_id": 555,
         "proc_id": 0,
@@ -434,7 +436,7 @@ def execute_node(monkeypatch, tmp_path):
 
 
 def _ndjson_files(root: Path) -> list[str]:
-    return sorted(p.name for p in (root / "output" / "provenance").iterdir())
+    return sorted(p.name for p in (root / "output" / "provenance").glob("*.ndjson"))
 
 
 def test_run_id_is_cluster_when_no_env_var_or_batch_name(monkeypatch, execute_node):

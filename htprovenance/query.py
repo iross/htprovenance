@@ -21,6 +21,7 @@ example queries.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 import sqlite3
 from contextlib import closing
@@ -41,9 +42,11 @@ from htprovenance.history_enrich import _DEFAULT_BATCH_SIZE
 from htprovenance.lineage import (
     chain_between,
     downstream_outputs,
+    job_label,
     resolve_hash,
     software_for_output,
 )
+from htprovenance.packages import diff_package_sets, job_package_set, packages_in_set
 
 app = typer.Typer(no_args_is_help=True)
 db_app = typer.Typer(no_args_is_help=True, help="Build/refresh the local SQLite provenance database.")
@@ -54,6 +57,12 @@ files_app = typer.Typer(
     "SHA-256, a local file, or a file name / URL recorded in the database.",
 )
 app.add_typer(files_app, name="files")
+packages_app = typer.Typer(
+    no_args_is_help=True,
+    help="Python packages installed in a job's environment. JOB arguments are "
+    "<cluster>.<proc> or <schedd>#<cluster>.<proc>, as `files software` prints them.",
+)
+app.add_typer(packages_app, name="packages")
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +480,16 @@ def _format_file(entry: dict | None) -> str:
     return text
 
 
+def _format_environment(environment: dict) -> str:
+    """Return one line of key=value pairs, with the package set shortened to 12 characters."""
+    fields = dict(environment)
+    set_hash = fields.pop("package_set_hash", None)
+    count = fields.pop("package_count", None)
+    if set_hash:
+        fields["packages"] = f"{count} (set {set_hash[:12]})"
+    return "  ".join(f"{k}={v}" for k, v in fields.items()) or "not recorded"
+
+
 @files_app.command("software")
 def files_software(
     file: Annotated[str, typer.Argument(help="Output file: hash, local file, or recorded name")],
@@ -491,8 +510,7 @@ def files_software(
             typer.echo(f"    output       {_format_file(output)}")
         typer.echo(f"    executable   {_format_file(record['executable'])}")
         typer.echo(f"    container    {_format_file(record['container'])}")
-        environment = "  ".join(f"{k}={v}" for k, v in record["environment"].items())
-        typer.echo(f"    environment  {environment or 'not recorded'}")
+        typer.echo(f"    environment  {_format_environment(record['environment'])}")
 
 
 @files_app.command("downstream")
@@ -549,6 +567,105 @@ def files_chain(
 
 def main() -> None:
     app()
+
+
+_JOB_SPEC = re.compile(r"(?:(?P<schedd>[^#]+)#)?(?P<cluster>\d+)(?:\.(?P<proc>\d+))?")
+
+
+def _job_or_exit(conn: sqlite3.Connection, spec: str) -> tuple[str, int, int]:
+    """Return (schedd, cluster_id, proc_id) for a JOB argument; proc defaults to 0."""
+    match = _JOB_SPEC.fullmatch(spec)
+    if match is None:
+        typer.echo(
+            f"Error: {spec!r} is not <cluster>.<proc> or <schedd>#<cluster>.<proc>", err=True
+        )
+        raise typer.Exit(1)
+    cluster_id, proc_id = int(match["cluster"]), int(match["proc"] or 0)
+    if match["schedd"]:
+        return match["schedd"], cluster_id, proc_id
+    schedds = [
+        row[0]
+        for row in conn.execute(
+            "SELECT DISTINCT json_extract(payload_json, '$.schedd') FROM events "
+            "WHERE type = 'job.assigned' AND json_extract(payload_json, '$.cluster_id') = ? "
+            "AND json_extract(payload_json, '$.proc_id') = ? ORDER BY 1",
+            (cluster_id, proc_id),
+        )
+        if row[0]
+    ]
+    if len(schedds) != 1:
+        problem = (
+            f"is recorded on {len(schedds)} schedds ({', '.join(schedds)}); "
+            f"name one, e.g. {schedds[0]}#{cluster_id}.{proc_id}"
+            if schedds
+            else "has no job.assigned event in this database"
+        )
+        typer.echo(f"Error: job {cluster_id}.{proc_id} {problem}", err=True)
+        raise typer.Exit(1)
+    return schedds[0], cluster_id, proc_id
+
+
+def _job_packages_or_exit(conn: sqlite3.Connection, spec: str) -> dict:
+    job = _job_or_exit(conn, spec)
+    try:
+        set_hash, count = job_package_set(conn, job)
+        packages = packages_in_set(conn, set_hash, count)
+    except LookupError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    return {"job": job_label(job), "package_set_hash": set_hash, "packages": packages}
+
+
+@packages_app.command("show")
+def packages_show(
+    job: Annotated[str, typer.Argument(help="Job: <cluster>.<proc> or <schedd>#<cluster>.<proc>")],
+    db: _DbOption = DEFAULT_DB_PATH,
+    json_out: _JsonOption = False,
+) -> None:
+    """List the Python packages installed in a job's environment."""
+    with closing(_open_lineage_db(db)) as conn:
+        record = _job_packages_or_exit(conn, job)
+    if json_out:
+        typer.echo(json.dumps(record, indent=2))
+        return
+    typer.echo(
+        f"{record['job']}  {len(record['packages'])} package(s)  "
+        f"set {record['package_set_hash']}"
+    )
+    for name, version in record["packages"].items():
+        typer.echo(f"  {name}=={version}")
+
+
+@packages_app.command("diff")
+def packages_diff(
+    job_a: Annotated[str, typer.Argument(help="First job")],
+    job_b: Annotated[str, typer.Argument(help="Second job")],
+    db: _DbOption = DEFAULT_DB_PATH,
+    json_out: _JsonOption = False,
+) -> None:
+    """Show how the second job's installed packages differ from the first job's."""
+    with closing(_open_lineage_db(db)) as conn:
+        first = _job_packages_or_exit(conn, job_a)
+        second = _job_packages_or_exit(conn, job_b)
+    diff = diff_package_sets(first["packages"], second["packages"])
+    identical = first["package_set_hash"] == second["package_set_hash"]
+    if json_out:
+        jobs = {"first": first["job"], "second": second["job"], "identical": identical}
+        typer.echo(json.dumps({**jobs, **diff}, indent=2))
+        return
+    if identical:
+        typer.echo(
+            f"{first['job']} and {second['job']} ran with the same "
+            f"{len(first['packages'])} package(s)  set {first['package_set_hash']}"
+        )
+        return
+    typer.echo(f"Packages of {second['job']} compared with {first['job']}")
+    for name, change in diff["changed"].items():
+        typer.echo(f"  changed  {name}  {change['from']} -> {change['to']}")
+    for name, version in diff["added"].items():
+        typer.echo(f"  added    {name}=={version}")
+    for name, version in diff["removed"].items():
+        typer.echo(f"  removed  {name}=={version}")
 
 
 if __name__ == "__main__":

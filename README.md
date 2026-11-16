@@ -192,6 +192,39 @@ lists the hashes so you can pass the one you mean. The environment
 job's `job.assigned` event, so it is only present when htprovenance is
 installed in the job's Python environment.
 
+## Installed packages: which versions a job ran with
+
+A job with htprovenance installed also records the Python packages
+installed in its environment, as seen by the first Python interpreter the
+job starts. Many jobs share one environment, so the list is stored once per
+distinct set, not once per job:
+
+- The job's `job.assigned` event carries `package_set_hash` (a SHA-256 of
+  the sorted `name==version` lines) and `package_count`.
+- The list itself goes to `packages.<package_set_hash>.json`, written
+  beside the job's NDJSON file. Its content depends only on the set, so
+  jobs with the same environment return identical files that replace each
+  other. A job that lists `transfer_output_files` needs to return this
+  file the same way it returns its NDJSON.
+- `db build` reads the list files from its `--event-dir` directories into
+  the `package_sets` table.
+
+`files software` shows the package count and the first 12 characters of the
+set hash, so two outputs made with the same packages show the same value.
+To see the packages, or what changed between two jobs:
+
+```bash
+# Every package and version in a job's environment
+htprovenance-query packages show 8762378.0
+
+# What the second job's environment changed, added or removed
+htprovenance-query packages diff 8756942.0 8762378.0
+```
+
+A job is named `<cluster>.<proc>`, or `<schedd>#<cluster>.<proc>` when the
+database holds the same cluster ID from more than one access point. A job
+that runs more than one Python environment has only the first one recorded.
+
 ## CLI
 
 | Command | Purpose |
@@ -199,7 +232,7 @@ installed in the job's Python environment.
 | `htprovenance-pre` | DAGMan `SCRIPT PRE` hook — emits `job.submitted` |
 | `htprovenance-post` | DAGMan `SCRIPT POST` hook — emits `job.completed`/`job.failed` |
 | `htprovenance-log-monitor` | DAGMan `SERVICE` — tails the HTCondor event log |
-| `htprovenance-query` | Build/query the provenance database; lineage lookups |
+| `htprovenance-query` | Build/query the provenance database; lineage and package lookups |
 | `htprovenance-repair` | Repair/backfill existing provenance data |
 | `htprovenance-hash` | Run inside a job: record SHA-256 hashes of its input or output files |
 
