@@ -365,10 +365,6 @@ def main() -> None:
     print(json.dumps(payload) if payload is not None else "{}")
 
 
-if __name__ == "__main__":
-    main()
-
-
 def _capture_execute_node(
     ad: dict, log_dir: Path, gpu_info: dict | None, fields_file: str | Path | None
 ) -> dict | None:
@@ -417,3 +413,7 @@ def _capture_submit_host(
     )
     marker.write_text("")
     return payload
+
+
+if __name__ == "__main__":
+    main()

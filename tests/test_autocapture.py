@@ -1,6 +1,8 @@
 import json
+import os
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -624,3 +626,28 @@ def test_main_passes_gpu_overrides_through(monkeypatch, tmp_path, capsys):
     assert out["gpu_model"] == "A100"
     assert out["gpu_count"] == 1
     assert out["gpu_id"] == "GPU-torch"
+
+
+def test_running_as_module_captures_execute_node_job(tmp_path):
+    job_ad = tmp_path / "job.ad"
+    _write_job_ad(job_ad, {**SAMPLE_JOB_AD, "GlobalJobId": "ap.example#555.0#1"})
+    env = {
+        **os.environ,
+        "_CONDOR_JOB_AD": str(job_ad),
+        "HTPROVENANCE_NO_AUTORUN": "1",
+        "PYTHONPATH": str(Path(autocapture.__file__).parent.parent),
+    }
+    env.pop("PROVENANCE_RUN_ID", None)
+    env.pop("PROVENANCE_LOG_DIR", None)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "htprovenance.autocapture"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout)["cluster_id"] == 555
+    assert (tmp_path / "cluster-555.555.0.ndjson").exists()
