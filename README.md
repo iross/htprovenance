@@ -132,6 +132,12 @@ with any Python 3.9 or later and no other packages: add the wheel to
 PYTHONPATH=htprovenance-<version>-py3-none-any.whl python3 -m htprovenance.filehash inputs
 ```
 
+Hashing reads every byte of every file, so it adds time in proportion to
+the data. One measurement, on a CHTC execute node (e4046, submitted from
+ap2002, 2026-11-16): a 2 GB file took 5.1 s, about 400 MB/s. The file had
+just been written in the job's sandbox, so it was probably served from
+memory; a large input read from disk for the first time may hash slower.
+
 `db build` files the hashes in the `file_edges` table, keyed by
 `(schedd, cluster_id, proc_id, role, path)`. Files are matched by hash, so
 jobs link up wherever one job's output is another's input, whatever the file
